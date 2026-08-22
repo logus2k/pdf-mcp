@@ -1,0 +1,599 @@
+/* pdf-mcp Chat — PDF beside an LLM that reads it.
+ *
+ * Layout mirrors docbro: tocPane | contentPane | rightPane, resizable with
+ * the vendored Split.js. The middle pane hosts docbro's PdfRenderer /
+ * LayoutManager / PdfControls trio via DocumentViewer (copied from cv).
+ *
+ * The chat streams from /api/chat: the backend runs the agent loop against
+ * pdf-mcp's tools and forwards every step as an SSE event, so tool calls and
+ * their results are visible rather than hidden behind a spinner.
+ */
+
+import { DocumentViewer } from "./viewer.js";
+import { ThinkingParser } from "./thinking.js";
+import { renderMarkdown, applyMarkdownExtras, escapeHtml } from "./markdown.js";
+
+const el = (id) => document.getElementById(id);
+
+const state = {
+  files: [],
+  document: null,
+  viewer: null,
+  history: [],      // neutral transcript sent back to the server each turn
+  streaming: false,
+  abort: null,
+  activeCitation: null,
+};
+
+/* ---------------- viewer ---------------- */
+
+function initViewer() {
+  const host = el("contentPane");
+  state.viewer = new DocumentViewer();
+  host.appendChild(state.viewer.element);
+}
+
+async function openDocument(path) {
+  if (!path) return;
+  state.document = path;
+  el("viewer-empty")?.remove();
+  updateDocStatus(path);
+  const url = `/api/document?path=${encodeURIComponent(path)}`;
+  await state.viewer.show({ url });
+  await loadToc(path);
+  refreshCacheStatus();
+}
+
+async function loadToc(path) {
+  const list = el("toc-list");
+  list.textContent = "";
+  try {
+    const res = await fetch("/api/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "pdf_get_toc", arguments: { path } }),
+    });
+    const data = await res.json();
+    const payload = JSON.parse(data.content[0].text);
+    const entries = payload.toc || [];
+    el("toc-count").textContent = entries.length ? String(entries.length) : "";
+    if (!entries.length) {
+      const li = document.createElement("li");
+      li.className = "toc-empty";
+      li.textContent = "No outline in this PDF.";
+      list.appendChild(li);
+      return;
+    }
+    for (const entry of entries) {
+      const li = document.createElement("li");
+      li.className = `toc-item lvl-${Math.min(entry.level || 1, 4)}`;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = entry.title || "(untitled)";
+      btn.title = `page ${entry.page}`;
+      btn.addEventListener("click", () => jumpToPage(entry.page));
+      li.appendChild(btn);
+      list.appendChild(li);
+    }
+  } catch (err) {
+    const li = document.createElement("li");
+    li.className = "toc-empty";
+    li.textContent = "Outline unavailable.";
+    list.appendChild(li);
+  }
+}
+
+function jumpToPage(page, bbox) {
+  if (!state.viewer || !page) return;
+  const regions = [{ page_no: page, bbox: bbox || null }];
+  if (bbox) {
+    state.viewer.showBboxHighlights(regions);
+  } else {
+    state.viewer.showBboxHighlights([{ page_no: page, bbox: [0, 0, 1, 1] }]);
+    state.viewer.clearBboxHighlights();
+  }
+}
+
+/* ---------------- chat rendering ---------------- */
+
+function addBubble(role) {
+  const scroll = el("chat-scroll");
+  const wrap = document.createElement("div");
+  wrap.className = `bubble ${role}`;
+
+  const body = document.createElement("div");
+  body.className = "bubble-body";
+  wrap.appendChild(body);
+
+  scroll.appendChild(wrap);
+  scroll.scrollTop = scroll.scrollHeight;
+  return { wrap, body };
+}
+
+function ensureThinkingBlock(wrap) {
+  let block = wrap.querySelector(".think");
+  if (block) return block;
+  block = document.createElement("details");
+  block.className = "think";
+  const summary = document.createElement("summary");
+  summary.textContent = "Thinking";
+  const body = document.createElement("div");
+  body.className = "think-body";
+  block.appendChild(summary);
+  block.appendChild(body);
+  wrap.insertBefore(block, wrap.firstChild);
+  return block;
+}
+
+function addToolChip(wrap, tool, args) {
+  const chip = document.createElement("div");
+  chip.className = "toolchip running";
+  const name = document.createElement("span");
+  name.className = "tool-name";
+  name.textContent = tool;
+  const detail = document.createElement("code");
+  detail.textContent = summariseArgs(args);
+  chip.appendChild(name);
+  chip.appendChild(detail);
+  // Tool calls precede the answer they inform, so insert above the answer body
+  // rather than appending — reading order should match execution order.
+  wrap.insertBefore(chip, wrap.querySelector(".bubble-body"));
+  el("chat-scroll").scrollTop = el("chat-scroll").scrollHeight;
+  return chip;
+}
+
+function summariseArgs(args) {
+  const parts = [];
+  for (const [k, v] of Object.entries(args || {})) {
+    let shown = typeof v === "string" ? v : JSON.stringify(v);
+    if (k === "path" || k === "paths") {
+      const bits = String(shown).split("/");
+      shown = bits[bits.length - 1];
+    }
+    if (shown && shown.length > 40) shown = shown.slice(0, 40) + "…";
+    parts.push(`${k}=${shown}`);
+  }
+  return parts.join("  ");
+}
+
+function addCitations(wrap, citations) {
+  if (!citations || !citations.length) return;
+  const seen = new Set();
+  const row = document.createElement("div");
+  row.className = "cites";
+  for (const cite of citations) {
+    if (cite.page == null || seen.has(cite.page)) continue;
+    seen.add(cite.page);
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.className = "cite";
+    badge.textContent = `p.${cite.page}`;
+    if (cite.excerpt) badge.title = cite.excerpt;
+    badge.addEventListener("click", () => {
+      // Clicking the active badge again dismisses the highlight.
+      if (state.activeCitation === badge) {
+        state.viewer?.clearBboxHighlights();
+        state.activeCitation = null;
+        badge.classList.remove("active");
+        return;
+      }
+      document.querySelectorAll(".cite.active").forEach((b) => b.classList.remove("active"));
+      badge.classList.add("active");
+      state.activeCitation = badge;
+      jumpToPage(cite.page, cite.bbox);
+    });
+    row.appendChild(badge);
+  }
+  if (row.childElementCount) wrap.insertBefore(row, wrap.querySelector(".bubble-body"));
+}
+
+document.addEventListener("bboxhighlights-cleared", () => {
+  document.querySelectorAll(".cite.active").forEach((b) => b.classList.remove("active"));
+  state.activeCitation = null;
+});
+
+/* ---------------- the turn ---------------- */
+
+async function send(question) {
+  if (state.streaming || !question.trim()) return;
+  el("chat-intro")?.remove();
+
+  const user = addBubble("user");
+  user.body.textContent = question;
+  state.history.push({ role: "user", content: question });
+
+  const assistant = addBubble("assistant");
+  const parser = new ThinkingParser();
+  let answer = "";
+  let thinkingBody = null;
+
+  state.streaming = true;
+  const startedAt = Date.now();
+  let toolCount = 0;
+  el("send-btn").disabled = true;
+  el("stop-btn").hidden = false;
+  status.set("activity", "waiting for model…", "busy");
+  const controller = new AbortController();
+  state.abort = controller;
+
+  const paintAnswer = () => {
+    assistant.body.innerHTML = renderMarkdown(answer);
+    applyMarkdownExtras(assistant.body);
+    el("chat-scroll").scrollTop = el("chat-scroll").scrollHeight;
+  };
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: state.history,
+        provider: el("provider-select").value || "local",
+        document: state.document,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok || !res.body) {
+      throw new Error(`chat request failed: ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by a blank line.
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (!frame.startsWith("data:")) continue;
+        let event;
+        try {
+          event = JSON.parse(frame.slice(5).trim());
+        } catch (e) {
+          continue;
+        }
+
+        if (event.type === "token") {
+          const out = parser.processToken(event.text);
+          if (out.type === "thinking_start" || out.type === "thinking_delta") {
+            const block = ensureThinkingBlock(assistant.wrap);
+            thinkingBody = block.querySelector(".think-body");
+            thinkingBody.textContent = out.thinking || "";
+          } else if (out.type === "thinking_end") {
+            const block = ensureThinkingBlock(assistant.wrap);
+            block.querySelector(".think-body").textContent = out.thinking || "";
+            if (out.answer) { answer += out.answer; paintAnswer(); }
+          } else if (out.type === "answer_delta" && out.answer) {
+            answer += out.answer;
+            paintAnswer();
+          }
+        } else if (event.type === "tool_call") {
+          const chip = addToolChip(assistant.wrap, event.tool, event.arguments);
+          chip.dataset.tool = event.tool;
+          toolCount += 1;
+          status.set("activity", `${event.tool}…`, "busy");
+        } else if (event.type === "tool_result") {
+          const chips = assistant.wrap.querySelectorAll(`.toolchip.running[data-tool="${event.tool}"]`);
+          const chip = chips[chips.length - 1];
+          if (chip) {
+            chip.classList.remove("running");
+            chip.classList.add(event.is_error ? "failed" : "ok");
+            const meta = document.createElement("span");
+            meta.className = "tool-meta";
+            meta.textContent = event.is_error ? "error" : `${event.chars} chars`;
+            chip.appendChild(meta);
+          }
+          addCitations(assistant.wrap, event.citations);
+          for (const img of event.images || []) {
+            const image = document.createElement("img");
+            image.className = "tool-image";
+            image.src = `data:${img.mimeType};base64,${img.data}`;
+            assistant.wrap.appendChild(image);
+          }
+        } else if (event.type === "tool_error") {
+          const chip = assistant.wrap.querySelector(`.toolchip.running[data-tool="${event.tool}"]`);
+          if (chip) { chip.classList.remove("running"); chip.classList.add("failed"); }
+        } else if (event.type === "answer") {
+          const tail = parser.flush();
+          if (tail) answer += tail;
+          if (event.content && !answer) answer = event.content;
+          paintAnswer();
+        } else if (event.type === "error") {
+          const box = document.createElement("div");
+          box.className = "chat-error";
+          box.textContent = event.message;
+          assistant.wrap.appendChild(box);
+          status.set("activity", "turn failed", "failed");
+        }
+      }
+    }
+
+    const tail = parser.flush();
+    if (tail) { answer += tail; paintAnswer(); }
+    if (answer) state.history.push({ role: "assistant", content: answer });
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      const box = document.createElement("div");
+      box.className = "chat-error";
+      box.textContent = String(err);
+      assistant.wrap.appendChild(box);
+    }
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    el("send-btn").disabled = false;
+    el("stop-btn").hidden = true;
+    const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+    if (el("st-activity").className.indexOf("failed") === -1) {
+      status.set("activity",
+        `${toolCount} tool${toolCount === 1 ? "" : "s"} · ${secs}s`, "");
+    }
+    refreshCacheStatus();
+  }
+}
+
+/* ---------------- chrome ---------------- */
+
+async function loadDocuments() {
+  const res = await fetch("/api/documents");
+  const data = await res.json();
+  state.files = data.files || [];
+  const select = el("doc-select");
+  select.textContent = "";
+  if (!state.files.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "— no PDFs under allowed roots —";
+    select.appendChild(opt);
+    return;
+  }
+  for (const file of state.files) {
+    const opt = document.createElement("option");
+    opt.value = file.path;
+    opt.textContent = file.name;
+    select.appendChild(opt);
+  }
+  select.value = state.files[0].path;
+}
+
+async function loadProviders() {
+  const res = await fetch("/api/providers");
+  const data = await res.json();
+  const select = el("provider-select");
+  select.textContent = "";
+  for (const [key, info] of Object.entries(data.providers)) {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = info.ready ? info.label : `${info.label} (unavailable)`;
+    opt.disabled = !info.ready;
+    opt.title = info.detail;
+    select.appendChild(opt);
+  }
+  select.value = "local";
+  const syncModel = () => {
+    const info = data.providers[select.value];
+    status.set("model", info ? info.label : select.value);
+  };
+  syncModel();
+  select.addEventListener("change", syncModel);
+  select.addEventListener("change", () => {
+    const chosen = data.providers[select.value];
+    el("composer-note").textContent = chosen && !chosen.ready ? chosen.detail : "";
+  });
+}
+
+/* ---------------- status bar ----------------
+ * One setter per slot so adding a new readout later is a single line here
+ * plus a <span> in chat.html. Every value shown is real state pulled from the
+ * viewer, the backend, or the running turn — no decorative placeholders.
+ */
+
+const status = {
+  set(slot, text, cls) {
+    const node = el(`st-${slot}`);
+    if (!node) return;
+    if (text !== undefined && text !== null) node.textContent = text;
+    if (cls !== undefined) node.className = "st" + (cls ? " " + cls : "");
+  },
+  conn(text, dotClass) {
+    const node = el("st-conn-text");
+    if (node) node.textContent = text;
+    const dot = document.querySelector("#st-conn .st-dot");
+    if (dot) dot.className = "st-dot" + (dotClass ? " " + dotClass : "");
+  },
+};
+
+function humanBytes(bytes) {
+  if (!bytes && bytes !== 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/* The PDF control box already tracks page and zoom; mirror its readouts rather
+ * than forking the copied renderer to emit events. Polling is cheap and keeps
+ * the vendored trio untouched. */
+function startViewerReadouts() {
+  setInterval(() => {
+    const pageInput = document.getElementById("pcbPageInput");
+    const pageTotal = document.getElementById("pcbPageTotal");
+    const zoom = document.getElementById("pcbZoomValue");
+    if (pageInput && pageTotal && pageTotal.textContent !== "0") {
+      status.set("page", `page ${pageInput.value} / ${pageTotal.textContent}`);
+    }
+    if (zoom && zoom.value) status.set("zoom", `zoom ${zoom.value}`);
+  }, 700);
+}
+
+async function refreshCacheStatus() {
+  try {
+    const res = await fetch("/api/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "pdf_cache_stats", arguments: {} }),
+    });
+    const data = await res.json();
+    const s = JSON.parse(data.content[0].text);
+    status.set("cache", `cache ${s.total_files} docs · ${s.total_pages} pages · ${s.cache_size_mb} MB`);
+  } catch (err) {
+    status.set("cache", "cache —");
+  }
+}
+
+function updateDocStatus(path) {
+  const file = state.files.find((f) => f.path === path);
+  if (!file) { status.set("doc", "—"); return; }
+  status.set("doc", `${file.name} · ${humanBytes(file.size_bytes)}`);
+  el("st-doc").title = file.path;
+}
+
+/* ---------------- upload ---------------- */
+
+async function uploadDocument(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const note = el("composer-note");
+  const btn = el("upload-btn");
+  btn.disabled = true;
+  btn.textContent = "Uploading…";
+  note.className = "composer-note";
+  note.textContent = `Uploading ${file.name}…`;
+
+  try {
+    // The bytes travel in the request body as multipart/form-data — never in
+    // the URL, which a 20 MB PDF would blow past instantly.
+    const form = new FormData();
+    form.append("file", file, file.name);
+
+    const res = await fetch("/api/upload", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `upload failed (${res.status})`);
+
+    await loadDocuments();
+    el("doc-select").value = data.path;
+    await openDocument(data.path);
+
+    note.className = "composer-note ok";
+    note.textContent = data.error
+      ? `Saved ${data.name}, but pdf-mcp could not read it: ${data.error}`
+      : `Added ${data.name} — ${data.page_count} pages. Ask away.`;
+  } catch (err) {
+    note.className = "composer-note";
+    note.textContent = String(err.message || err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↑ Upload";
+    input.value = "";   // let the same file be re-picked later
+  }
+}
+
+/* Live document changes pushed by the backend's folder watcher, so a PDF
+ * dropped into the folder by any other means shows up without a reload. */
+function startDocumentWatch() {
+  const source = new EventSource("/api/events");
+  state.events = source;
+  source.onmessage = (evt) => {
+    let payload;
+    try { payload = JSON.parse(evt.data); } catch (e) { return; }
+    if (payload.kind !== "documents") return;
+    const keep = el("doc-select").value;
+    loadDocuments().then(() => {
+      const select = el("doc-select");
+      if (keep && state.files.some((f) => f.path === keep)) select.value = keep;
+      else if (select.value && select.value !== keep) openDocument(select.value);
+    });
+  };
+}
+
+async function pollHealth() {
+  try {
+    const res = await fetch("/api/health");
+    const data = await res.json();
+    el("health-dot").classList.toggle("ok", data.status === "ok");
+    const s = data.server || {};
+    el("server-version").textContent = `${s.name || "pdf-mcp"} ${s.version || ""}`;
+    status.conn(`${s.name || "pdf-mcp"} ${s.version || ""} · pid ${data.pid}`,
+                data.status === "ok" ? "ok" : "down");
+  } catch (err) {
+    el("health-dot").classList.add("down");
+    el("server-version").textContent = "backend unreachable";
+    status.conn("backend unreachable", "down");
+  }
+}
+
+function initTheme() {
+  const saved = localStorage.getItem("explorer-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+  el("theme-toggle").addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme ||
+      (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = current === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("explorer-theme", next);
+  });
+}
+
+function initSplit() {
+  if (typeof Split === "undefined") return;
+  Split(["#tocPane", "#contentPane", "#rightPane"], {
+    sizes: [16, 52, 32],
+    minSize: [0, 240, 260],
+    gutterSize: 6,
+    cursor: "col-resize",
+  });
+}
+
+async function boot() {
+  initTheme();
+  initSplit();
+  initViewer();
+  startDocumentWatch();
+  startViewerReadouts();
+  await pollHealth();
+  refreshCacheStatus();
+  setInterval(pollHealth, 15000);
+  await loadProviders();
+  await loadDocuments();
+
+  const select = el("doc-select");
+  select.addEventListener("change", () => openDocument(select.value));
+  if (select.value) await openDocument(select.value);
+
+  el("page-jump-btn").addEventListener("click", () => {
+    const n = Number.parseInt(el("page-jump-input").value, 10);
+    if (!Number.isNaN(n)) jumpToPage(n);
+  });
+
+  const input = el("chat-input");
+  el("composer").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const q = input.value;
+    input.value = "";
+    input.style.height = "auto";
+    send(q);
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      el("composer").requestSubmit();
+    }
+  });
+  el("stop-btn").addEventListener("click", () => state.abort?.abort());
+
+  const uploadInput = el("upload-input");
+  el("upload-btn").addEventListener("click", () => uploadInput.click());
+  uploadInput.addEventListener("change", () => uploadDocument(uploadInput));
+}
+
+boot();

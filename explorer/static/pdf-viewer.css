@@ -1,0 +1,270 @@
+/* cv-pdf-viewer.css
+ *
+ * Styles for the PDF.js-based CV reading view.
+ *
+ * Layout: the viewer fills the viewport; each rendered page is a
+ * position:relative wrapper that contains a canvas and an overlay div
+ * (used for citation-highlight rectangles).
+ */
+
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    color-scheme: light;
+}
+/* Original CV body styling — soft grey + linen texture (ported from
+ * styles.css). PDF pages sit on top of this so they look like printed
+ * sheets on a paper-textured desk rather than canvas on a dark void. */
+body.cv-pdf-mode {
+    background-color: #f6f7f9;
+    background-image: url('low-contrast-linen.png');
+    background-repeat: repeat;
+    background-attachment: fixed;
+    overflow: hidden;
+}
+
+/* Two-element scrolling architecture, mirroring the legacy HTML CV's
+   .page-scroll wrapper around .page (see styles.css). #cv-pdf-stage is the
+   viewport-filling element that reflows for the chat panel; #cv-pdf-host
+   is the actual scroll container, sized to roughly page-width + a slim
+   scrollbar slot, so the scrollbar lands NEXT TO the CV page rather than
+   at the viewport edge or the chat panel's left edge. */
+#cv-pdf-stage {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    /* No background — let the body's linen texture show through. */
+    transition: right 0.18s ease;
+}
+body.cvchat-open #cv-pdf-stage {
+    right: var(--cvchat-panel-w, 720px);
+}
+
+#cv-pdf-host {
+    /* Scrollable container. Width tracks the page layout via the runtime
+       CSS variable --cv-pdf-host-w set by cv-pdf-viewer.js: when the stage
+       fits two pages side-by-side it expands to a 2-page width; otherwise
+       it stays at a 1-page width. `flex-wrap: wrap` makes pages naturally
+       arrange in rows of 2 when the host is wide enough, else 1 per row. */
+    height: 100%;
+    max-width: var(--cv-pdf-host-w, 850px);
+    margin: 0 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 24px 0 80px;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    justify-content: center;
+    gap: 16px;
+    scroll-behavior: smooth;
+}
+
+/* Slim themed scrollbar — ported from the legacy HTML CV's .page-scroll
+ * styling (styles.css). 8px width, transparent track + thumb until the
+ * cursor is over a PDF page; blue thumb on hover. Defining the standard
+ * pseudo-elements is what tells Chromium to drop its native arrow
+ * scrollbar in favour of this themed one. */
+#cv-pdf-host::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+#cv-pdf-host::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 8px;
+    margin: 32px 0;
+}
+#cv-pdf-host::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.18s ease;
+}
+#cv-pdf-host:has(.cv-pdf-page:hover)::-webkit-scrollbar-thumb {
+    background: rgba(96, 150, 229, 0.60);
+}
+#cv-pdf-host::-webkit-scrollbar-thumb:hover {
+    background: rgba(72, 145, 255, 0.6);
+    cursor: pointer;
+}
+
+#cv-pdf-host .cv-pdf-page {
+    position: relative;
+    background: #ffffff;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    border-radius: 2px;
+}
+
+#cv-pdf-host .cv-pdf-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none; /* highlight rects don't intercept clicks */
+}
+
+/* Transparent <a> hot-zones over the canvas, one per /URI link annotation
+ * in the PDF. Clickable; barely-there hover hint so users get visual
+ * feedback that a region is interactive. */
+#cv-pdf-host .cv-pdf-links {
+    position: absolute;
+    inset: 0;
+    pointer-events: none; /* layer is invisible — only children take clicks */
+}
+#cv-pdf-host .cv-pdf-link {
+    position: absolute;
+    pointer-events: auto;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: background 0.12s ease;
+}
+#cv-pdf-host .cv-pdf-link:hover {
+    background: rgba(72, 145, 255, 0.18);
+}
+
+#cv-pdf-host .cv-pdf-highlight {
+    position: absolute;
+    background: rgba(253, 230, 138, 0.55);
+    border: 1.5px solid rgba(180, 130, 0, 0.7);
+    border-radius: 2px;
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.18);
+    transition: background-color 280ms ease;
+    pointer-events: none;
+    z-index: 2;
+}
+
+/* Loading indicator (replaced as soon as the first page mounts). */
+#cv-pdf-host::before {
+    content: "Loading CV…";
+    color: #c2cad3;
+    font: 600 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 24vh auto 0;
+    letter-spacing: 0.02em;
+}
+#cv-pdf-host:has(.cv-pdf-page)::before { content: none; }
+
+/* In the PDF reading view, the Download-PDF affordance and the Diana
+ * chat-with-my-assistant badge are NOT viewport-corner chrome — they
+ * overlay the FIRST PDF PAGE itself, scrolling with the document. The
+ * viewer JS (_attachChromeToPage1) re-parents both elements into the
+ * page-1 wrapper after the PDF renders. Until then a fallback bottom-right
+ * floating launcher is used in case page rendering hasn't finished yet. */
+
+/* Download PDF — small icon-only square in the top-right corner of page 1.
+ * Same visual idiom as the print button in the legacy HTML CV layout. */
+.cv-pdf-page .cv-pdf-chrome {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 5;
+}
+.cv-pdf-page .cv-pdf-chrome a {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgb(255 255 255 / 78%);
+    backdrop-filter: blur(8px);
+    color: #f0f4f8;
+    text-decoration: none;
+    border: 0.5px solid #cccccc;
+}
+.cv-pdf-page .cv-pdf-chrome a:hover {
+    background: rgba(40, 44, 50, 0.92);
+}
+.cv-pdf-page .cv-pdf-chrome a span { display: none; }      /* icon only */
+.cv-pdf-page .cv-pdf-chrome img    { width: 18px; height: 18px; }
+
+/* Diana chat badge — positioned in the gap between the contact-info row
+ * and the SUMMARY heading on page 1. The Summary section starts at PDF
+ * y ≈ 637 on an A4 page (842 pt tall) which is ~24% from the top; the
+ * contact line ends slightly above, so 19-20% lands the badge cleanly
+ * in the gap. Right-aligned to mirror the Download icon at top-right. */
+body.cv-pdf-mode .cv-pdf-page .cvchat-launcher {
+    position: absolute;
+    top: 1%;
+    right: 32%;
+    bottom: auto;
+    left: auto;
+    margin: 0;
+    z-index: 5;
+    padding: 6px 18px 6px 6px;
+    border-radius: 999px;
+    gap: 12px;
+    background: #ffe19b;
+    box-shadow: 0 8px 24px rgba(12, 94, 110, 0.32),
+                0 2px 6px rgba(0, 0, 0, 0.16);
+}
+body.cv-pdf-mode .cv-pdf-page .cvchat-launcher:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 30px rgba(12, 94, 110, 0.45),
+                0 2px 6px rgba(0, 0, 0, 0.22);
+}
+body.cv-pdf-mode .cv-pdf-page .cvchat-launcher .cvchat-launcher-img {
+    width: 56px;
+    height: 56px;
+    border-width: 2px;
+}
+body.cv-pdf-mode .cv-pdf-page .cvchat-launcher > span {
+    font-size: 13px;
+    max-width: 225px;
+    font-weight: 400;
+    font-family: Arial;
+}
+
+/* Fallback launcher style for the brief moment between cv-chat.js inserting
+ * the launcher into the DOM and the viewer moving it into page 1. Float
+ * bottom-right (universal pattern) so it stays clickable even if the
+ * re-parent never happens. Hidden automatically by the existing
+ * `body.cvchat-open .cvchat-launcher { display: none }` rule. */
+body.cv-pdf-mode .cvchat-launcher {
+    position: fixed;
+    bottom: 22px;
+    right: 22px;
+    top: auto;
+    margin: 0;
+    z-index: 60;
+    padding: 6px 18px 6px 6px;
+    border-radius: 999px;
+    gap: 12px;
+    background: #ffe19b;
+    box-shadow: 0 12px 30px rgba(12, 94, 110, 0.38),
+                0 2px 6px rgba(0, 0, 0, 0.18);
+}
+
+.cv-pdf-chrome a, .cv-pdf-chrome button {
+    background: rgba(20, 24, 28, 0.78);
+    color: #f0f4f8;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font: 500 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    transition: background 160ms ease;
+}
+.cv-pdf-chrome a:hover, .cv-pdf-chrome button:hover {
+    background: rgba(40, 44, 50, 0.92);
+}
+
+/* Mobile: scale page-width to viewport; the cv-pdf-page wrapper width is
+ * set inline by the renderer, so we use a transform-origin shrink for
+ * cases narrower than the smallest natural page width. */
+@media (max-width: 720px) {
+    #cv-pdf-host {
+        padding: 16px 8px 80px;
+    }
+    .cv-pdf-chrome a, .cv-pdf-chrome button {
+        font-size: 12px;
+        padding: 6px 10px;
+    }
+}

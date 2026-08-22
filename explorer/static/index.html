@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pdf-mcp Explorer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="health-dot" title="server status"></span>
+      <h1>pdf-mcp Explorer</h1>
+      <span class="version" id="server-version">connecting…</span>
+    </div>
+    <div class="topbar-right">
+      <label class="doc-picker">
+        <span>Document</span>
+        <select id="doc-select">
+          <option value="">— loading —</option>
+        </select>
+      </label>
+      <a class="linkbtn" href="/">← Chat with a document</a>
+      <button id="theme-toggle" type="button" title="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <nav class="sidebar" aria-label="Tools">
+      <div class="sidebar-head">
+        <h2>Tools</h2>
+        <span class="count" id="tool-count"></span>
+      </div>
+      <input type="search" id="tool-filter" placeholder="Filter tools…" autocomplete="off" />
+      <ul id="tool-list" class="tool-list"></ul>
+    </nav>
+
+    <section class="panel">
+      <div id="tool-header" class="tool-header">
+        <h2 id="tool-name">Select a tool</h2>
+        <p id="tool-desc" class="tool-desc">
+          Every form on this page is generated from the server's own
+          <code>tools/list</code> JSON Schema, so it stays in step with pdf-mcp.
+        </p>
+      </div>
+
+      <form id="tool-form" class="tool-form" autocomplete="off"></form>
+
+      <div class="actions" id="actions" hidden>
+        <button type="button" id="run-btn" class="primary">Run</button>
+        <button type="button" id="reset-btn">Reset</button>
+        <span id="timing" class="timing"></span>
+      </div>
+
+      <div class="result-head" id="result-head" hidden>
+        <h3>Result</h3>
+        <div class="result-tabs">
+          <button type="button" data-view="pretty" class="tab active">Rendered</button>
+          <button type="button" data-view="raw" class="tab">Raw JSON</button>
+        </div>
+      </div>
+      <div id="result" class="result"></div>
+    </section>
+
+    <aside class="activity" aria-label="Activity">
+      <div class="sidebar-head">
+        <h2>Activity</h2>
+        <button type="button" id="clear-log" class="ghost">clear</button>
+      </div>
+      <ul id="log" class="log"></ul>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

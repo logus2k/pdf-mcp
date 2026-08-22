@@ -1,0 +1,453 @@
+/* cv-document-viewer.css
+ *
+ * Ported from docbro's styles.css — PDF page tiles, columns grid,
+ * text/annotation layers, and the floating .pdf-controlbox — plus
+ * the CV-specific bbox highlight overlays and the .cv-pdf-chrome /
+ * .cvchat-launcher positioning inside .pdf-page.
+ *
+ * Class contract (matches docbro):
+ *   .document-viewer-wrapper                    — outer host (this.element)
+ *   .content-container.content-pane             — docbro's contentContainer
+ *   .document-content.active.pdf-doc            — per-document flex column
+ *   .document-content-inner.pdf-content         — page tiles + scroll host
+ *   .document-content-inner.pdf-content.pdf-cols — LayoutManager grid mode
+ *   .pdf-page                                    — one page tile
+ *   #pdfControlBox / .pdf-controlbox            — floating control box
+ *
+ * LayoutManager pushes:
+ *   --pdf-page-width      (px)   width of each page
+ *   --pdf-grid-cols       (rule) grid-template-columns
+ *   --pdf-content-maxw    (px)   inner pdf-content max-width
+ *
+ * NOTE: --pdf-zoom is intentionally left unset in this file — docbro's
+ * layout is px-based, not a multiplier. The `var(--pdf-zoom, 1)`
+ * fallbacks on the chrome + launcher rules make those overlays render
+ * at their base (1×) size regardless of PDF zoom.
+ */
+
+/* --- wrapper + inner containers --------------------------------------- */
+
+.document-viewer-wrapper {
+    height: 100%;
+    display: flex;
+    box-sizing: border-box;
+    background: transparent;
+}
+
+.document-viewer-wrapper .content-container {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+}
+
+.document-content {
+    display: none;
+    width: 100%;
+    margin: 0;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    /* border-box so any padding (e.g. the 7 px inset on .pdf-doc)
+       lives INSIDE the 100 % width — otherwise the doc extends past
+       the stage on the right and looks like the chat panel is
+       occluding the PDF. */
+    box-sizing: border-box;
+}
+.document-content.active {
+    display: flex;
+    flex-direction: column;
+}
+/* Center the (narrowed) PDF scroll container so the vertical scrollbar
+   sits near the page's right border instead of at the far pane edge. */
+.document-content.active.pdf-doc {
+    align-items: center;
+    padding: 7px 0px;
+}
+
+.document-content-inner {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    box-sizing: border-box;
+}
+.document-content-inner.pdf-content {
+    padding: 0 5px 0 0;
+    align-items: flex-start;
+}
+
+/* --- PDF page tile ---------------------------------------------------- */
+
+.pdf-page {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    overflow: hidden;
+    border: 0.5px solid #99999999;
+    box-shadow: rgba(60, 64, 67, 0.3) 0px 1px 2px 0px,
+                rgba(60, 64, 67, 0.15) 0px 1px 3px 1px;
+    max-width: calc(900px * var(--pdf-zoom, 1));
+    width: 100%;
+    margin: 0 auto 5px auto;
+    background: white;
+}
+.pdf-page:empty {
+    background-color: #f0f0f0;
+}
+/* Direct-child scope: the pdf.js canvas + annotation-layer imgs are
+   direct children of .pdf-page. Descendants (e.g. Diana's portrait
+   inside .cvchat-launcher, which is re-parented into .pdf-page by
+   the shell's MutationObserver) must NOT inherit width: 100% or they
+   render at their parent's max-content = natural image size. */
+.pdf-page > canvas,
+.pdf-page > img {
+    display: block;
+    width: 100% !important;
+    height: auto !important;
+}
+
+/* Text layer (transparent overlay for text selection). */
+.pdf-page .textLayer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    opacity: 0.25;
+    line-height: 1.0;
+}
+.pdf-page .textLayer span {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    transform-origin: 0 0;
+    font-size: calc(var(--scale-factor) * var(--font-height));
+    transform: scaleX(var(--scale-x));
+}
+.pdf-page .textLayer ::selection {
+    background: rgba(0, 0, 255, 0.3);
+}
+
+/* Annotation layer (PDF URI links). */
+.pdf-page .annotationLayer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    z-index: 2;
+    pointer-events: none;
+}
+.pdf-page .annotationLayer section,
+.pdf-page .annotationLayer a {
+    pointer-events: auto;
+    cursor: pointer;
+}
+
+/* --- columns grid (LayoutManager) ------------------------------------- */
+
+.document-content-inner.pdf-content.pdf-cols {
+    display: grid;
+    grid-template-columns: var(--pdf-grid-cols, max-content);
+    grid-auto-rows: max-content;
+    justify-content: center;
+    align-content: start;
+    align-items: start;
+    gap: 6px;
+    overflow-x: auto;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--pdf-content-maxw, 100%);
+    padding-left: 0;
+    padding-right: 0;
+}
+.document-content-inner.pdf-content.pdf-cols .pdf-page {
+    width: var(--pdf-page-width, 100%);
+    max-width: none;
+    margin: 0;
+    box-shadow: rgba(0, 0, 0, 0.25) 0px 0.0625em 0.0625em,
+                rgba(0, 0, 0, 0.25) 0px 0.125em 0.5em,
+                rgba(255, 255, 255, 0.1) 0px 0px 0px 1px inset;
+}
+/* Same direct-child scope as the base rule above — must not force
+   Diana's re-parented launcher img to fill the whole page. */
+.document-content-inner.pdf-content.pdf-cols .pdf-page > canvas,
+.document-content-inner.pdf-content.pdf-cols .pdf-page > img {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
+}
+
+/* --- scrollbar (slim, appears on hover of the pane) ------------------- */
+
+.document-content-inner.pdf-content::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+.document-content-inner.pdf-content::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 8px;
+    margin-block: 4px;
+}
+.document-content-inner.pdf-content::-webkit-scrollbar-thumb {
+    background-color: transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color 0.18s ease;
+}
+/* Only reveal the scrollbar thumb when the cursor is actually over
+   a page tile (or grabbing the thumb itself). Hovering the pane
+   background or the control-box area no longer shows the scrollbar. */
+.document-content-inner.pdf-content:has(.pdf-page:hover)::-webkit-scrollbar-thumb {
+    background-color: rgba(96, 150, 229, 0.60);
+}
+.document-content-inner.pdf-content::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(72, 145, 255, 0.6);
+}
+
+/* --- CV-specific: chrome overlay (Download PDF pill) ------------------ */
+
+.pdf-page > .cv-pdf-chrome {
+    position: absolute;
+    top: calc(14px * var(--pdf-zoom, 1));
+    right: calc(14px * var(--pdf-zoom, 1));
+    z-index: 5;
+    /* Hidden until the user hovers over the document — same affordance
+       as the slim scrollbar fading in on hover. */
+    opacity: 0;
+    transition: opacity 0.18s ease;
+}
+/* Chrome fades in only when a page tile is actually being hovered
+   (or the chrome itself). Hovering the pane background — including
+   the empty space around the pages — leaves it hidden. */
+.pdf-content:has(.pdf-page:hover) .pdf-page > .cv-pdf-chrome,
+.pdf-page > .cv-pdf-chrome:hover,
+.pdf-page > .cv-pdf-chrome:focus-within {
+    opacity: 1;
+}
+.pdf-page > .cv-pdf-chrome a {
+    width: calc(36px * var(--pdf-zoom, 1));
+    height: calc(36px * var(--pdf-zoom, 1));
+    border-radius: calc(8px * var(--pdf-zoom, 1));
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgb(255 255 255 / 78%);
+    backdrop-filter: blur(8px);
+    border: 0.5px solid #cccccc;
+    text-decoration: none;
+}
+.pdf-page > .cv-pdf-chrome img {
+    width: calc(18px * var(--pdf-zoom, 1));
+    height: calc(18px * var(--pdf-zoom, 1));
+}
+
+/* --- CV-specific: Diana launcher (merged pill + portrait) ------------- */
+
+body.cv-pdf-mode .pdf-page > .cvchat-launcher {
+    position: absolute;
+    top: calc(10px * var(--pdf-zoom, 1));
+    right: 30%;
+    bottom: auto;
+    left: auto;
+    margin: 0;
+    z-index: 5;
+    padding: 0;
+    background: transparent;
+    border-radius: 0;
+    box-shadow: none;
+    gap: 0;
+    flex-direction: row-reverse;
+    align-items: center;
+}
+body.cv-pdf-mode .pdf-page > .cvchat-launcher:hover {
+    transform: translateY(calc(-2px * var(--pdf-zoom, 1)));
+}
+body.cv-pdf-mode .pdf-page > .cvchat-launcher .cvchat-launcher-img {
+    width: calc(56px * var(--pdf-zoom, 1));
+    height: calc(56px * var(--pdf-zoom, 1));
+    border-width: calc(7px * var(--pdf-zoom, 1));
+    flex: none;
+    margin-left: calc(-8px * var(--pdf-zoom, 1));
+    position: relative;
+    z-index: 1;
+    border-color: #ffe19b;
+}
+body.cv-pdf-mode .pdf-page > .cvchat-launcher:hover .cvchat-launcher-img {
+    box-shadow: 0 calc(12px * var(--pdf-zoom, 1)) calc(30px * var(--pdf-zoom, 1)) rgba(12, 94, 110, 0.45),
+                0 calc(2px * var(--pdf-zoom, 1)) calc(6px * var(--pdf-zoom, 1)) rgba(0, 0, 0, 0.22);
+}
+body.cv-pdf-mode .pdf-page > .cvchat-launcher > span {
+    font-size: calc(13px * var(--pdf-zoom, 1));
+    font-weight: 400;
+    font-family: Arial;
+    max-width: calc(225px * var(--pdf-zoom, 1));
+    line-height: 1.2;
+    align-self: center;
+    height: auto;
+    background: #ffe19b;
+    padding: calc(8px * var(--pdf-zoom, 1)) calc(14px * var(--pdf-zoom, 1));
+    border-radius: 999px 0px 0px 999px;
+}
+body.cv-pdf-mode .pdf-page > .cvchat-launcher:hover > span {
+    box-shadow: 0 calc(12px * var(--pdf-zoom, 1)) calc(30px * var(--pdf-zoom, 1)) rgba(12, 94, 110, 0.45),
+                0 calc(2px * var(--pdf-zoom, 1)) calc(6px * var(--pdf-zoom, 1)) rgba(0, 0, 0, 0.22);
+}
+
+/* --- CV-specific: citation bbox highlight overlay --------------------- */
+
+.pdf-bbox-highlight-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    z-index: 3;
+    pointer-events: none;
+}
+.pdf-bbox-highlight {
+    position: absolute;
+    background: rgb(0 255 139 / 16%);
+    border: 0.5px dashed #559766;
+    border-radius: 2px;
+    box-shadow: 0 0 0 4px rgba(255, 220, 0, 0.10);
+    animation: pdf-bbox-fadein 0.18s ease;
+    /* Layer is pointer-events:none so PDF text selection still works.
+       Rect itself is interactive so clicking it dismisses the
+       highlight (mirrors clicking the citation badge a second time). */
+    pointer-events: auto;
+    cursor: pointer;
+}
+@keyframes pdf-bbox-fadein {
+    from { opacity: 0; transform: scale(1.04); }
+    to   { opacity: 1; transform: scale(1); }
+}
+
+/* --- floating control box (docbro's .pdf-controlbox) ------------------ */
+
+.pdf-controlbox {
+    position: absolute;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%) translateY(6px);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 9px;
+    background: rgba(31, 31, 31, 0.92);
+    border: 0.5px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    color: #e6e6e6;
+    font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    user-select: none;
+    z-index: 60;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.pdf-controlbox.visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+}
+.pcb-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    height: 26px;
+    padding: 0 6px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: #e6e6e6;
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+}
+.pcb-btn:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffc630;
+}
+.pcb-btn.pcb-glyph { font-size: 15px; }
+.pcb-sep {
+    width: 1px;
+    align-self: stretch;
+    margin: 2px 4px;
+    background: rgba(255, 255, 255, 0.15);
+}
+.pcb-page {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-variant-numeric: tabular-nums;
+}
+.pcb-page-input {
+    width: 34px;
+    height: 22px;
+    text-align: center;
+    background: rgba(255, 255, 255, 0.08);
+    border: 0.5px solid rgba(255, 255, 255, 0.18);
+    border-radius: 5px;
+    color: #fff;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    outline: none;
+}
+.pcb-page-input:focus { border-color: #ffc630; }
+.pcb-page-sep { color: #9a9a9a; }
+.pcb-page-total { min-width: 14px; color: #cfcfcf; }
+.pcb-zoom {
+    min-width: 40px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    color: #cfcfcf;
+}
+/* Editable zoom readout (CV variant): styled like the page input so the
+   two editables in the bar read as a matched pair. */
+.pcb-zoom-input {
+    width: 52px;
+    height: 22px;
+    padding: 0 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 0.5px solid rgba(255, 255, 255, 0.18);
+    border-radius: 5px;
+    color: #fff;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+}
+.pcb-zoom-input:focus { border-color: #ffc630; }
+.pcb-cols-icon {
+    font-size: 15px;
+    color: #cfcfcf;
+    line-height: 1;
+}
+.pcb-cols {
+    width: 70px;
+    accent-color: #ffc630;
+    cursor: pointer;
+}
+.pcb-cols-value {
+    min-width: 10px;
+    text-align: center;
+    color: #cfcfcf;
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- error state ------------------------------------------------------ */
+
+.document-viewer-error {
+    padding: 32px;
+    text-align: center;
+    color: #c1432a;
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}

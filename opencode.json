@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "pdf-mcp": {
+      "type": "local",
+      "command": ["/home/logus/env/assets/pdf-mcp/.venv_pdf-mcp/bin/pdf-mcp"],
+      "enabled": true
+    }
+  }
+}

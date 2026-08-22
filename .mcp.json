@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pdf-mcp": {
+      "command": "/home/logus/env/assets/pdf-mcp/.venv_pdf-mcp/bin/pdf-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

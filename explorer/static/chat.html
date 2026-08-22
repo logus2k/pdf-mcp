@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pdf-mcp Chat</title>
+  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css" />
+  <link rel="stylesheet" href="/static/pdf-viewer.css" />
+  <link rel="stylesheet" href="/static/document-viewer.css" />
+  <link rel="stylesheet" href="/static/chat.css" />
+</head>
+<body class="chat-body">
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="health-dot"></span>
+      <h1>pdf-mcp Chat</h1>
+      <span class="version" id="server-version">connecting…</span>
+    </div>
+    <div class="topbar-right">
+      <label class="doc-picker">
+        <span>Document</span>
+        <select id="doc-select"><option value="">— loading —</option></select>
+      </label>
+      <input type="file" id="upload-input" accept="application/pdf,.pdf" hidden />
+      <button type="button" id="upload-btn" title="Add a PDF to the document folder">
+        ↑ Upload
+      </button>
+      <label class="doc-picker">
+        <span>Model</span>
+        <select id="provider-select"></select>
+      </label>
+      <a class="linkbtn" href="/tools">Tools ↗</a>
+      <button id="theme-toggle" type="button" title="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <div class="split-root" id="splitRoot">
+    <div class="pane toc-pane" id="tocPane">
+      <div class="pane-head">
+        <h2>Contents</h2>
+        <span class="count" id="toc-count"></span>
+      </div>
+      <ul class="toc-list" id="toc-list">
+        <li class="toc-empty">Load a document to see its outline.</li>
+      </ul>
+      <div class="pane-head" style="margin-top:14px">
+        <h2>Pages</h2>
+      </div>
+      <div class="page-jump">
+        <input type="number" id="page-jump-input" min="1" placeholder="page #" />
+        <button type="button" id="page-jump-btn">Go</button>
+      </div>
+    </div>
+
+    <div class="pane content-pane-host" id="contentPane">
+      <div class="viewer-empty" id="viewer-empty">
+        <p>Pick a document to open it here.</p>
+      </div>
+    </div>
+
+    <div class="pane right-pane" id="rightPane">
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat-intro" id="chat-intro">
+          <h2>Ask about this document</h2>
+          <p>
+            Answers come from the PDF itself — the model calls pdf-mcp's
+            search and read tools, then cites the pages it used. Click a page
+            citation to jump to it and highlight the passage.
+          </p>
+        </div>
+      </div>
+      <form class="composer" id="composer">
+        <textarea id="chat-input" rows="1" placeholder="Ask a question about the document…"></textarea>
+        <button type="submit" id="send-btn" class="primary">Send</button>
+        <button type="button" id="stop-btn" class="ghost" hidden>Stop</button>
+      </form>
+      <div class="composer-note" id="composer-note"></div>
+    </div>
+  </div>
+
+  <footer class="statusbar" id="statusbar">
+    <span class="st" id="st-conn" title="MCP server connection">
+      <i class="st-dot"></i><b id="st-conn-text">connecting…</b>
+    </span>
+    <span class="st" id="st-doc" title="Open document">—</span>
+    <span class="st" id="st-page" title="Current page">page —</span>
+    <span class="st" id="st-zoom" title="Zoom level">—</span>
+    <span class="st st-spacer"></span>
+    <span class="st" id="st-activity" title="Last turn">idle</span>
+    <span class="st" id="st-model" title="Answering model">—</span>
+    <span class="st" id="st-cache" title="pdf-mcp SQLite cache">cache —</span>
+  </footer>
+
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/highlight/highlight.min.js"></script>
+  <script src="/static/vendor/katex/katex.min.js"></script>
+  <script src="/static/vendor/katex/katex-auto-render.min.js"></script>
+  <script src="/static/vendor/split/split.min.js"></script>
+  <script type="module" src="/static/chat.js"></script>
+</body>
+</html>

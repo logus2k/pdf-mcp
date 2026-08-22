@@ -376,7 +376,11 @@ async function loadProviders() {
     opt.title = info.detail;
     select.appendChild(opt);
   }
-  select.value = "local";
+  // Default to the first ready local model; provider keys are now
+  // "local:<model id>" discovered at runtime, so no literal key is valid here.
+  const firstReady = Object.entries(data.providers)
+    .find(([key, info]) => info.ready && key.startsWith("local:"));
+  select.value = firstReady ? firstReady[0] : select.options[0]?.value || "";
   const syncModel = () => {
     const info = data.providers[select.value];
     status.set("model", info ? info.label : select.value);

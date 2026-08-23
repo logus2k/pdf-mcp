@@ -269,3 +269,54 @@ button.ghost { background: none; border-color: transparent; color: var(--ink-sof
 @media (max-width: 1000px) {
   #st-cache, #st-zoom { display: none; }
 }
+
+/* pdf.js appends its own scratch canvas (<canvas class="hiddenCanvasElement">)
+ * directly to <body> for font/image measurement. Because .chat-body is a
+ * flex column, that canvas became a flex ITEM and claimed ~850px of height,
+ * squeezing all three panes down to ~76px — pages then fit-computed to 40x61
+ * specks in a 16-column grid, which reads as "the document doesn't render".
+ * Only appears for documents whose content makes pdf.js allocate it, which is
+ * why small text-only PDFs were unaffected.
+ *
+ * Take any stray body-level canvas out of the flex flow. It stays fully
+ * renderable — 2d drawing and getImageData work on a hidden, positioned
+ * canvas — it simply no longer participates in layout. */
+body > canvas {
+  position: absolute !important;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* ---------- indexing progress (status bar) ---------- */
+
+.st-warm { gap: 7px; }
+.st-warm[hidden] { display: none; }
+
+.warm-track {
+  width: 110px; height: 6px; border-radius: 3px;
+  background: var(--line); overflow: hidden; flex: none;
+}
+.warm-fill {
+  display: block; height: 100%; width: 0%;
+  background: var(--accent);
+  transition: width .35s ease;
+}
+.warm-label { color: var(--ink); }
+.warm-num { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+
+.warm-spin {
+  width: 8px; height: 8px; flex: none; border-radius: 50%;
+  border: 1.5px solid var(--accent); border-top-color: transparent;
+  animation: warm-spin .8s linear infinite;
+}
+@keyframes warm-spin { to { transform: rotate(360deg); } }
+
+.st-warm.done .warm-spin { border-color: var(--ok); border-top-color: var(--ok); animation: none; }
+.st-warm.done .warm-fill { background: var(--ok); }
+.st-warm.failed .warm-spin { border-color: var(--err); border-top-color: var(--err); animation: none; }
+.st-warm.failed .warm-fill { background: var(--err); }
+
+@media (prefers-reduced-motion: reduce) { .warm-spin { animation: none; } }

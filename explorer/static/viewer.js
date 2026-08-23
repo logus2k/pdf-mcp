@@ -78,6 +78,11 @@ export class DocumentViewer {
         this._pdfControls = null;
     }
 
+    /** Re-rasterise all rendered pages (used after a crispness change). */
+    rerenderAll() {
+        return this._pdfRenderer?.rerenderAll?.() ?? 0;
+    }
+
     /** Host element to mount into the DOM. */
     get element() { return this._wrapper; }
 
@@ -135,10 +140,71 @@ export class DocumentViewer {
             this._layoutManager.initForDocument();
             this._pdfRenderer.startLazyRendering(this._pdfDoc, this._innerDiv);
             this._pdfControls.showForDocument(true);
+            // Deferred on purpose: priming synchronously here rasterises
+            // pages before the browser has laid the container out, and the
+            // layout manager's fit calculation then measures an unsettled
+            // container — collapsing every page to a ~40px speck in a
+            // 16-column grid.
+            //
+            // Two schedulers race, first-one-wins: rAF is the correct signal
+            // (fires once layout is done), but it never fires in some
+            // headless/embedded configurations, so a timer backs it up.
+            // primeFirstPages is idempotent and re-checks the layout itself.
+            this._schedulePrime();
         } catch (err) {
             this._innerDiv.innerHTML =
                 `<div class="document-viewer-error">Failed to load PDF: ${err.message}</div>`;
         }
+    }
+
+    /** Render the first few pages directly, without waiting for the
+     *  IntersectionObserver to report them visible.
+     *
+     *  Lazy rendering is driven entirely by that observer. When it does not
+     *  fire — it is silent in some headless/embedded browser configurations,
+     *  and can be starved on a very long document whose scroll container is
+     *  hundreds of thousands of pixels tall — every page stays 'idle' and the
+     *  pane shows nothing but empty placeholders. Priming the top of the
+     *  document guarantees the reader always sees page 1, and costs one render
+     *  that lazy loading would have done anyway. */
+    _schedulePrime() {
+        if (this._primeScheduled) return;
+        this._primeScheduled = true;
+        let done = false;
+        const run = () => {
+            if (done) return;
+            done = true;
+            this._primeScheduled = false;
+            this.primeFirstPages();
+        };
+        requestAnimationFrame(() => requestAnimationFrame(run));
+        setTimeout(run, 300);
+    }
+
+    primeFirstPages(count = 3) {
+        const renderer = this._pdfRenderer;
+        if (!renderer || !this._pdfDoc || !this._innerDiv) return;
+        const pageDivs = renderer.pdfPageDivs;
+        if (!pageDivs || !pageDivs.length) return;
+
+        // Refuse to prime against a container that has not been laid out.
+        // Rendering into an unsettled layout is what caused the collapse this
+        // guard exists to prevent, so skip rather than risk it.
+        if (this._innerDiv.clientHeight < 100 || pageDivs[0].clientWidth < 100) {
+            return 0;
+        }
+
+        let queued = 0;
+        for (const pageDiv of pageDivs.slice(0, count)) {
+            if (pageDiv._renderState === 'rendered' || pageDiv._renderState === 'rendering') continue;
+            renderer._enqueueRender(pageDiv);
+            queued++;
+        }
+        if (queued) {
+            renderer._processRenderQueue(
+                this._pdfDoc, this._innerDiv, renderer._renderVersion);
+        }
+        return queued;
     }
 
     // ── Citation-highlight API ─────────────────────────────────────
@@ -211,7 +277,23 @@ export class DocumentViewer {
 
         let left, top, width, height;
         try {
-            const [vx1, vy1, vx2, vy2] = viewport.convertToViewportRectangle(bbox);
+            // pdf-mcp reports bboxes in PyMuPDF convention: origin TOP-left,
+            // y increasing downward. Verified against pdf-mcp's own `clip`
+            // field, which is documented top-left and equals bbox/page_rect
+            // exactly. convertToViewportRectangle expects PDF user space —
+            // origin BOTTOM-left, y increasing upward — so handing it the
+            // bbox unchanged mirrored every highlight vertically: a citation
+            // 12% down the page painted 87% down it.
+            //
+            // Flip about the page's top edge first, then let pdf.js apply
+            // scale and rotation as it normally would. view[3] is used rather
+            // than the height so pages with a non-zero origin (cropbox
+            // offsets) convert correctly too.
+            const view = pageDiv._pdfPage.view || [0, 0, viewport.width, viewport.height];
+            const pageTopPdfY = view[3];
+            const [bx0, by0, bx1, by1] = bbox;
+            const pdfRect = [bx0, pageTopPdfY - by1, bx1, pageTopPdfY - by0];
+            const [vx1, vy1, vx2, vy2] = viewport.convertToViewportRectangle(pdfRect);
             left = Math.min(vx1, vx2);
             top = Math.min(vy1, vy2);
             width = Math.abs(vx2 - vx1);

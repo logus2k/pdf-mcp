@@ -10,10 +10,22 @@
  */
 
 import { DocumentViewer } from "./viewer.js";
+import { SUPERSAMPLE_KEY, readSupersample } from "./pdf-renderer.js";
 import { ThinkingParser } from "./thinking.js";
 import { renderMarkdown, applyMarkdownExtras, escapeHtml } from "./markdown.js";
 
 const el = (id) => document.getElementById(id);
+
+/* Opt-in tracing: append ?debug=1 to the URL. Prints every event that can
+ * change the open document or the dropdown selection, so a misbehaving
+ * sequence can be read straight off the console. */
+const DEBUG = new URLSearchParams(location.search).has("debug");
+let _traceT0 = Date.now();
+function trace(...args) {
+  if (!DEBUG) return;
+  const t = String(Date.now() - _traceT0).padStart(6, " ");
+  console.log(`%c[pdfchat +${t}ms]`, "color:#2f6feb;font-weight:bold", ...args);
+}
 
 const state = {
   files: [],
@@ -33,14 +45,79 @@ function initViewer() {
   host.appendChild(state.viewer.element);
 }
 
+let _openSeq = 0;
+
+/* Dump the state of the viewer one layer below the DOM: box sizes, computed
+ * visibility, scroll position, how many canvases actually exist, and the
+ * renderer's per-page state machine. A pane that is blank while the page divs
+ * are present is one of: zero-sized boxes, hidden/clipped ancestors, a scroll
+ * position past the content, or pages stuck 'idle' (never rasterised). */
+function traceGeometry(seq) {
+  if (!DEBUG) return;
+  const box = (sel) => {
+    const e = document.querySelector(sel);
+    if (!e) return "MISSING";
+    const r = e.getBoundingClientRect();
+    const cs = getComputedStyle(e);
+    return {
+      w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top),
+      display: cs.display, visibility: cs.visibility, opacity: cs.opacity,
+      overflow: cs.overflow, position: cs.position,
+    };
+  };
+  const inner = document.querySelector(".document-content-inner");
+  const pages = [...document.querySelectorAll(".pdf-page")];
+  const first = pages[0] ? pages[0].getBoundingClientRect() : null;
+
+  setTimeout(() => {
+    trace("GEOMETRY", seq, {
+      wrapper: box(".document-viewer-wrapper"),
+      container: box(".content-container"),
+      content: box(".document-content"),
+      inner: box(".document-content-inner"),
+      innerScroll: inner
+        ? { scrollTop: inner.scrollTop, scrollHeight: inner.scrollHeight,
+            clientHeight: inner.clientHeight,
+            gridCols: getComputedStyle(inner).gridTemplateColumns }
+        : "MISSING",
+      pageCount: pages.length,
+      firstPage: first
+        ? { w: Math.round(first.width), h: Math.round(first.height),
+            top: Math.round(first.top), left: Math.round(first.left) }
+        : null,
+      renderStates: pages.slice(0, 5).map((d) => d._renderState),
+      hasPdfPage: pages.slice(0, 3).map((d) => !!d._pdfPage),
+      canvases: document.querySelectorAll("canvas").length,
+      canvasSizes: [...document.querySelectorAll("canvas")].slice(0, 3)
+        .map((c) => c.width + "x" + c.height),
+    });
+  }, 2500);   // after the eager prime has had a chance to rasterise
+}
+
 async function openDocument(path) {
   if (!path) return;
+  const seq = ++_openSeq;
+  trace("openDocument START", seq, path.split("/").pop());
   state.document = path;
   el("viewer-empty")?.remove();
   updateDocStatus(path);
   const url = `/api/document?path=${encodeURIComponent(path)}`;
-  await state.viewer.show({ url });
+  try {
+    await state.viewer.show({ url });
+    trace("viewer.show DONE", seq,
+          "pageDivs=" + document.querySelectorAll(".pdf-page").length,
+          "contentDivs=" + document.querySelectorAll(".document-content").length);
+  } catch (err) {
+    trace("viewer.show FAILED", seq, String(err));
+    throw err;
+  }
+  traceGeometry(seq);
+  if (seq !== _openSeq) {
+    trace("SUPERSEDED", seq, "-> a newer open (", _openSeq, ") started; abandoning");
+    return;
+  }
   await loadToc(path);
+  trace("openDocument END", seq, "select=" + el("doc-select").value.split("/").pop());
   refreshCacheStatus();
 }
 
@@ -360,7 +437,19 @@ async function loadDocuments() {
     opt.textContent = file.name;
     select.appendChild(opt);
   }
-  select.value = state.files[0].path;
+  // Rebuilding the list must never steal the selection: if a document is open,
+  // keep pointing at it. Only pick a default when nothing is open yet.
+  // (Assigning .value does not fire 'change', so this cannot reopen anything.)
+  const before = select.value;
+  if (state.document && state.files.some((f) => f.path === state.document)) {
+    select.value = state.document;
+  } else {
+    select.value = state.files[0].path;
+  }
+  if (before !== select.value) {
+    trace("loadDocuments changed selection",
+          (before || "(none)").split("/").pop(), "->", select.value.split("/").pop());
+  }
 }
 
 async function loadProviders() {
@@ -445,7 +534,15 @@ async function refreshCacheStatus() {
     });
     const data = await res.json();
     const s = JSON.parse(data.content[0].text);
-    status.set("cache", `cache ${s.total_files} docs · ${s.total_pages} pages · ${s.cache_size_mb} MB`);
+    // Whole-cache totals, NOT the open document. Showing a page count here read
+    // as "this document has 18 pages" next to a 453-page book, so the count is
+    // dropped from the label and spelled out in the tooltip instead.
+    status.set("cache", `cache ${s.total_files} docs · ${s.cache_size_mb} MB`);
+    const node = el("st-cache");
+    if (node) {
+      node.title = `pdf-mcp cache across ALL documents: ${s.total_files} docs, ` +
+                   `${s.total_pages} pages indexed, ${s.cache_size_mb} MB`;
+    }
   } catch (err) {
     status.set("cache", "cache —");
   }
@@ -458,6 +555,57 @@ function updateDocStatus(path) {
   el("st-doc").title = file.path;
 }
 
+/* ---------------- indexing progress ----------------
+ * A document is viewable immediately but not answerable until pdf-mcp has
+ * extracted text and computed embeddings for every page (~44s for 453 pages).
+ * The backend streams that progress; this renders it into the status bar so
+ * the wait is visible instead of looking like a hang. */
+
+let _warmHideTimer = null;
+
+function renderWarm(p) {
+  const slot = el("st-warm");
+  if (!slot) return;
+  const total = p.total || 0;
+  const units = (p.text_done || 0) + (p.emb_done || 0);
+  const pct = total ? Math.min(100, Math.round((units / (2 * total)) * 100)) : 0;
+
+  slot.hidden = false;
+  slot.classList.toggle("done", p.state === "done");
+  slot.classList.toggle("failed", p.state === "failed");
+  el("warm-fill").style.width = pct + "%";
+
+  if (p.state === "failed") {
+    el("warm-label").textContent = "indexing failed";
+    el("warm-num").textContent = p.message ? String(p.message).slice(0, 60) : "";
+  } else if (p.state === "done") {
+    el("warm-label").textContent = "ready";
+    el("warm-num").textContent = `${total} pages · ${p.elapsed}s`;
+  } else {
+    el("warm-label").textContent =
+      p.phase === "embedding" ? "embedding" : "extracting";
+    const shown = p.phase === "embedding" ? p.emb_done : p.text_done;
+    const eta = p.eta != null && p.eta > 0 ? ` · ~${Math.ceil(p.eta)}s left` : "";
+    el("warm-num").textContent = `${shown}/${total}${eta}`;
+  }
+  slot.title = `${p.name || "document"} — ${pct}% indexed`;
+
+  // Leave the finished state up briefly so the user sees it completed.
+  if (p.state === "failed") {
+    const note = el("composer-note");
+    if (note) {
+      note.className = "composer-note";
+      note.textContent = `Indexing failed for ${p.name}: ${p.message || "unknown error"}`;
+    }
+  }
+
+  clearTimeout(_warmHideTimer);
+  if (p.state === "done" || p.state === "failed") {
+    _warmHideTimer = setTimeout(() => { slot.hidden = true; }, 8000);
+    refreshCacheStatus();
+  }
+}
+
 /* ---------------- upload ---------------- */
 
 async function uploadDocument(input) {
@@ -468,7 +616,7 @@ async function uploadDocument(input) {
   btn.disabled = true;
   btn.textContent = "Uploading…";
   note.className = "composer-note";
-  note.textContent = `Uploading ${file.name}…`;
+  note.textContent = `Uploading ${file.name}…`;   // cleared when the POST returns
 
   try {
     // The bytes travel in the request body as multipart/form-data — never in
@@ -484,10 +632,13 @@ async function uploadDocument(input) {
     el("doc-select").value = data.path;
     await openDocument(data.path);
 
-    note.className = "composer-note ok";
+    // No success note: the status-bar progress reports the document name,
+    // page count and indexing state already, so a second copy of the same
+    // information under the composer is redundant. Failures still speak up.
+    note.className = "composer-note";
     note.textContent = data.error
       ? `Saved ${data.name}, but pdf-mcp could not read it: ${data.error}`
-      : `Added ${data.name} — ${data.page_count} pages. Ask away.`;
+      : "";
   } catch (err) {
     note.className = "composer-note";
     note.textContent = String(err.message || err);
@@ -506,13 +657,14 @@ function startDocumentWatch() {
   source.onmessage = (evt) => {
     let payload;
     try { payload = JSON.parse(evt.data); } catch (e) { return; }
+    if (payload.kind === "warm") { renderWarm(payload.payload || {}); return; }
     if (payload.kind !== "documents") return;
-    const keep = el("doc-select").value;
-    loadDocuments().then(() => {
-      const select = el("doc-select");
-      if (keep && state.files.some((f) => f.path === keep)) select.value = keep;
-      else if (select.value && select.value !== keep) openDocument(select.value);
-    });
+    // Refresh the list only. This event also fires for our own uploads, and
+    // reopening or re-selecting here raced the upload handler: the dropdown
+    // snapped back to the previous document while the viewer was mid-load,
+    // leaving a blank pane. Whoever initiated the change opens the document.
+    trace("SSE documents event -> refreshing list only");
+    loadDocuments();
   };
 }
 
@@ -554,7 +706,28 @@ function initSplit() {
   });
 }
 
+/* Live crispness control. Rendering is super-sampled and downscaled, which
+ * sharpens edges; too high and glyph antialiasing gets crushed. Exposed so the
+ * value can be compared side by side without an edit-reload cycle. */
+function installSupersampleControl() {
+  window.pdfSupersample = (value) => {
+    if (value === undefined) return readSupersample();
+    const n = Math.min(4, Math.max(1, Number.parseFloat(value)));
+    if (!Number.isFinite(n)) {
+      console.warn("pdfSupersample(n): pass a number between 1 and 4");
+      return readSupersample();
+    }
+    try { localStorage.setItem(SUPERSAMPLE_KEY, String(n)); } catch (e) {}
+    const repainted = state.viewer?.rerenderAll?.() ?? 0;
+    console.log(`%c[pdfchat] supersample = ${n} — re-rendering ${repainted} page(s)`,
+                "color:#2f6feb;font-weight:bold");
+    return n;
+  };
+  trace("supersample", readSupersample());
+}
+
 async function boot() {
+  installSupersampleControl();
   initTheme();
   initSplit();
   initViewer();
@@ -567,7 +740,10 @@ async function boot() {
   await loadDocuments();
 
   const select = el("doc-select");
-  select.addEventListener("change", () => openDocument(select.value));
+  select.addEventListener("change", () => {
+    trace("dropdown CHANGE ->", select.value.split("/").pop());
+    openDocument(select.value);
+  });
   if (select.value) await openDocument(select.value);
 
   el("page-jump-btn").addEventListener("click", () => {

@@ -1,5 +1,24 @@
 import { TextLayer } from './vendor/pdfjs/pdf.min.mjs';
 
+export const SUPERSAMPLE_DEFAULT = 2.0;
+export const SUPERSAMPLE_KEY = "pdf-supersample";
+
+/** Effective super-sampling factor: URL ?ss= wins, then a stored preference,
+ *  then the default. Clamped to a sane range — below 1 is blurrier than the
+ *  display can show, above 4 mostly burns memory for no visible gain. */
+export function readSupersample() {
+    let value = null;
+    try {
+        const fromUrl = new URLSearchParams(location.search).get("ss");
+        value = fromUrl !== null ? fromUrl : localStorage.getItem(SUPERSAMPLE_KEY);
+    } catch (e) {
+        value = null;
+    }
+    const n = Number.parseFloat(value);
+    if (!Number.isFinite(n)) return SUPERSAMPLE_DEFAULT;
+    return Math.min(4, Math.max(1, n));
+}
+
 export class PdfRenderer {
 
     constructor({ contentContainer, selectionMode }) {
@@ -394,10 +413,17 @@ export class PdfRenderer {
         // Rasterize ABOVE device resolution (super-sampling) so the browser's
         // downscale sharpens text/line edges — pdf.js draws with grayscale AA,
         // and oversampling closes much of the gap to a native PDF viewer.
-        // 2.5× flat across DPRs — was 1.8/1.5 (DPR<2 / DPR>=2); pushed up to
-        // reduce the residual "veil" on standard displays. Memory ceiling
-        // (MAX_CANVAS_PIXELS below) clamps runaway cases.
-        const SUPERSAMPLE = 2.5;
+        //
+        // History: 1.8/1.5 (DPR<2 / DPR>=2) -> 2.5 flat, to kill a residual
+        // "veil" on standard displays. 2.5 overshot: the downscale acts as a
+        // sharpening pass, and at that strength the soft antialias gradient on
+        // thin glyph stems gets crushed, so letter edges read as eaten rather
+        // than clean. 2.0 keeps the sharpness win without flattening the AA.
+        //
+        // Tunable at runtime without editing this file:
+        //   ?ss=2.3  in the URL, or
+        //   pdfSupersample(2.3)  from the console (re-renders immediately)
+        const SUPERSAMPLE = readSupersample();
         let scale = (cssWidth / baseWidth) * dpr * SUPERSAMPLE;
 
         const MAX_CANVAS_PIXELS = 24_000_000; // memory guard (~96 MB/canvas)
@@ -470,6 +496,26 @@ export class PdfRenderer {
         if (queued) {
             this._processRenderQueue(this._pdfDoc, this._pdfContainer, renderVersion);
         }
+    }
+
+    /** Re-rasterise every rendered page at the current super-sampling factor.
+     *  refreshResolution() deliberately skips pages whose CSS width did not
+     *  grow, so changing the factor needs its own path. */
+    rerenderAll() {
+        if (!this._pdfDoc || !this._pdfContainer) return 0;
+        const renderVersion = this._renderVersion;
+        let queued = 0;
+        for (const pageDiv of this._pdfPageDivs) {
+            if (pageDiv._renderState !== 'rendered') continue;
+            pageDiv._renderState = 'idle';
+            pageDiv._renderedCssWidth = 0;
+            this._enqueueRender(pageDiv);
+            queued++;
+        }
+        if (queued) {
+            this._processRenderQueue(this._pdfDoc, this._pdfContainer, renderVersion);
+        }
+        return queued;
     }
 
     get rotation() {

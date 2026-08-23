@@ -144,6 +144,7 @@ async def run_agent(
     provider: str = "local",
     all_tools: bool = False,
     document: str | None = None,
+    document_map: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Drive the LLM/tool loop, yielding events for the browser as they happen."""
     tools = select_tools(mcp_tools, all_tools=all_tools)
@@ -153,6 +154,10 @@ async def run_agent(
             f"\n\nThe user is currently viewing this document:\n{document}\n"
             "Use exactly this path in tool calls unless they name another."
         )
+    if document_map:
+        # Navigation aid only. The closing line of the rendered block repeats
+        # that answers must still come from the pages themselves.
+        system += "\n\n" + document_map
 
     convo = list(history)
     yield {"type": "start", "provider": provider,

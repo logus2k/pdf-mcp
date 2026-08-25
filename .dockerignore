@@ -1,0 +1,8 @@
+.venv_pdf-mcp/
+.venv_explorer/
+.git/
+data/
+__pycache__/
+**/__pycache__/
+*.pyc
+.claude/

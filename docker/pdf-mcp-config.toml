@@ -1,0 +1,20 @@
+# pdf-mcp access rules, container edition.
+#
+# pdf_mcp/config.py hardcodes ~/.config/pdf-mcp/config.toml with no env or CLI
+# override, so this file is COPYed to that exact path in the image.
+#
+# Paths are container paths, not host paths. The host's own config confines
+# reads to /home/logus/env/assets/pdf-mcp/data; here the same directory is
+# mounted at /documents, so the allow-list names that instead. Patterns are
+# fnmatch against the fully resolved path and `*` spans `/`, so the second
+# entry covers nested subdirectories.
+[paths]
+allow = [
+  "/documents",
+  "/documents/*",
+]
+
+# No remote fetching: deny every host, matching the host configuration.
+# Removing this line would let the server fetch https:// URLs itself.
+[urls]
+deny = ["*"]

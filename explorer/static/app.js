@@ -221,7 +221,7 @@ function humanSize(bytes) {
 }
 
 async function loadDocuments() {
-  const res = await fetch("/api/documents");
+  const res = await fetch("api/documents");
   const data = await res.json();
   state.files = data.files || [];
   const select = el("doc-select");
@@ -263,7 +263,7 @@ async function runTool() {
 
   const args = collectArguments(el("tool-form"));
   try {
-    const res = await fetch("/api/call", {
+    const res = await fetch("api/call", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: state.active.name, arguments: args }),
@@ -468,7 +468,7 @@ function addLogLine(kind, text) {
 }
 
 function startEvents() {
-  const source = new EventSource("/api/events");
+  const source = new EventSource("api/events");
   state.events = source; // exposed so tests/tools can close the stream
   source.onmessage = (event) => {
     let payload;
@@ -507,7 +507,7 @@ function startEvents() {
 
 async function pollHealth() {
   try {
-    const res = await fetch("/api/health");
+    const res = await fetch("api/health");
     const data = await res.json();
     const dot = el("health-dot");
     dot.classList.toggle("ok", data.status === "ok");
@@ -542,7 +542,7 @@ async function boot() {
   await pollHealth();
   setInterval(pollHealth, 10000);
 
-  const res = await fetch("/api/tools");
+  const res = await fetch("api/tools");
   const data = await res.json();
   state.tools = (data.tools || []).sort((a, b) => a.name.localeCompare(b.name));
   renderToolList("");

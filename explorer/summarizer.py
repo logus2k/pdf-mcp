@@ -75,7 +75,8 @@ You are given the document title and a per-chapter index. Write markdown:
 
 ## Core frameworks
 <The 5-8 most important named frameworks across the whole document. For each:
-**Name** (ch N) - what it is, and when to use it. One or two lines each.>
+**Name** (pp.X-Y) - what it is, and when to use it. One or two lines each.
+Copy the page range verbatim from the chapter index; never invent one.>
 
 Do not invent anything that is not in the chapter index. Under 700 words."""
 
@@ -108,14 +109,20 @@ def load_map(pdf_path: str) -> dict[str, Any] | None:
     return data
 
 
-def _segment_chapters(toc: list[dict[str, Any]], page_count: int) -> list[dict[str, Any]]:
+def _segment_chapters(toc: list[dict[str, Any]], page_count: int,
+                      _want_source: bool = False):
     """Turn a flat TOC into non-overlapping page ranges.
 
     Prefers the shallowest level that yields a usable number of chapters: a
     453-page book with 382 TOC entries would otherwise produce 382 LLM calls.
     """
-    if not toc:
-        return [{"title": "Whole document", "start": 1, "end": page_count, "level": 0}]
+    def _out(chapters, source):
+        return (chapters, source) if _want_source else chapters
+
+    # No early return for an empty TOC: it used to hand back one whole-document
+    # "chapter", so a document with ZERO entries — exactly the case the map
+    # exists for — got the weakest possible index. Fall through to the block
+    # splitter below, which is the real fallback.
 
     # Pick the level giving the FINEST usable granularity, not the shallowest.
     # Shallowest-first produced "Part I: The Patterns, pp.40-355" as a single
@@ -145,14 +152,35 @@ def _segment_chapters(toc: list[dict[str, Any]], page_count: int) -> list[dict[s
         if best is None or len(chapters) > len(best):
             best = chapters
     if best:
-        return best
+        return _out(best, "toc")
 
     # No level gave a workable split: fall back to fixed page blocks so a
-    # document with a useless TOC still gets a map.
-    block = max(10, page_count // min(MAX_CHAPTERS, 12))
-    return [{"title": f"Pages {s}-{min(s + block - 1, page_count)}",
-             "start": s, "end": min(s + block - 1, page_count), "level": 0}
-            for s in range(1, page_count + 1, block)]
+    # document with a useless TOC still gets a map. This path is the whole
+    # feature for TOC-less documents, so it must not be coarse: the previous
+    # formula gave an 18-page paper two 9-page blocks, which is barely an index
+    # at all. Target ~15 pages per block, with a floor of 4 blocks.
+    target_blocks = min(MAX_CHAPTERS, max(4, page_count // 15))
+    block = max(3, -(-page_count // target_blocks))
+    return _out([{"title": f"Pages {s}-{min(s + block - 1, page_count)}",
+                  "start": s, "end": min(s + block - 1, page_count), "level": 0}
+                 for s in range(1, page_count + 1, block)], "fallback")
+
+
+def toc_is_navigable(toc: list[dict[str, Any]], page_count: int) -> bool:
+    """Can the agent navigate this document from its own table of contents?
+
+    Decided by the same segmentation the map would use, rather than an
+    arbitrary entry-count threshold: if a TOC level yields a workable set of
+    page ranges, pdf_get_toc already gives the agent that index losslessly and
+    for free, so a generated map is redundant.
+
+    Measured over 144 A/B turns: on a 453-page book with 382 TOC entries the
+    map was slightly WORSE (22/24 vs 23/24 on-target, 8.3 vs 10.0 page refs);
+    on an 18-page paper whose TOC held a single entry it was clearly BETTER
+    (27/27 vs 25/27, 4.0 vs 2.9 page refs).
+    """
+    _, source = _segment_chapters(toc, page_count, _want_source=True)
+    return source == "toc"
 
 
 def _sample(text: str, budget: int = CHAPTER_CHAR_BUDGET) -> str:
@@ -206,7 +234,7 @@ async def build_core_map(
 
     toc_result = extract_json(await call_tool("pdf_get_toc", {"path": pdf_path}))
     toc = toc_result.get("toc", []) if isinstance(toc_result, dict) else []
-    chapters = _segment_chapters(toc, page_count)
+    chapters, segmentation = _segment_chapters(toc, page_count, _want_source=True)
 
     indexed: list[dict[str, Any]] = []
     for i, chapter in enumerate(chapters, 1):
@@ -270,6 +298,7 @@ async def build_core_map(
         "page_count": page_count, "provider": provider,
         "generated_at": time.time(),
         "elapsed": round(time.monotonic() - started, 1),
+        "segmentation": segmentation,
         "chapters": indexed,
         "digest": digest.strip(),
         "topics": {k: sorted(set(v)) for k, v in sorted(topics.items())},
@@ -285,18 +314,26 @@ def save_map(data: dict[str, Any]) -> Path:
 
 def render_for_prompt(data: dict[str, Any], max_topics: int = 60) -> str:
     """Flatten a stored map into the block injected into the system prompt."""
-    lines = [f"DOCUMENT MAP — {data['name']} ({data['page_count']} pages)", ""]
-    if data.get("digest"):
-        lines += [data["digest"], ""]
-    lines.append("Chapter index (use these page ranges to target pdf_read_pages):")
+    # Deliberately minimal. A fuller block (digest + per-chapter one-liners,
+    # ~2,800 tokens) was measured over 72 A/B turns: it won 24/24 vs 22/24 on
+    # finding the right pages, but produced 6 front-matter locators against 1,
+    # cost 19% more latency and yielded 17% fewer page citations. The prose was
+    # what the model paraphrased into wrong page numbers, so only the pointers
+    # survive here — the part that produced the win.
+    lines = [
+        "=== DOCUMENT INDEX (pointers only — NOT a source) ===",
+        f"{data['name']}, {data['page_count']} pages.",
+        "Use this ONLY to choose which pages to open. Never quote or answer from",
+        "it; cite the specific pages your tool call returns.",
+        "",
+        "Sections:",
+    ]
     for c in data.get("chapters", []):
-        lines.append(f"  pp.{c['start']}-{c['end']}  {c['title']} — {c['one_line']}")
+        lines.append(f"  pp.{c['start']}-{c['end']}  {c['title']}")
     topics = list(data.get("topics", {}).items())[:max_topics]
     if topics:
-        lines += ["", "Topic index (term → where it is discussed):"]
+        lines += ["", "Topics:"]
         for term, where in topics:
-            lines.append(f"  {term} → {', '.join(where[:3])}")
-    lines += ["", "This map is for NAVIGATION ONLY. It is generated and may be "
-              "imprecise. Never answer from it: use pdf_search or pdf_read_pages "
-              "to read the actual pages, and cite those pages."]
+            lines.append(f"  {term} → {where[0]}")
+    lines.append("=== end of index ===")
     return "\n".join(lines)

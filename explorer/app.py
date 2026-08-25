@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -28,10 +28,14 @@ from pydantic import BaseModel
 import agent
 import providers
 import summarizer
+import voice
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
-SERVER_BIN = PROJECT / ".venv_pdf-mcp" / "bin" / "pdf-mcp"
+# The pdf-mcp executable. On the host it lives in the project's own venv; in
+# the container pdf-mcp is installed system-wide, so the path differs.
+SERVER_BIN = Path(os.environ.get(
+    "EXPLORER_PDF_MCP_BIN", str(PROJECT / ".venv_pdf-mcp" / "bin" / "pdf-mcp")))
 
 # pdf_read_all and page renders return payloads far beyond asyncio's 64 KiB
 # default line limit; renders in particular are multi-MB base64.
@@ -314,10 +318,39 @@ async def tools_page() -> FileResponse:
 
 warm_state: dict[str, Any] = {}
 
-# Core-map generation is opt-in: it costs one LLM call per chapter, and its
-# value (fewer blind searches) is exactly what we are trying to measure.
-BUILD_MAP = os.environ.get("EXPLORER_BUILD_MAP", "").strip() == "1"
+# Core-map generation is conditional by default. Measured over 144 A/B turns:
+# the map HURTS on documents with a usable table of contents (pdf_get_toc is
+# lossless and free, so a generated index only competes with it) and HELPS on
+# documents without one. "auto" therefore builds a map only when the document
+# cannot be navigated from its own TOC.
+#   auto (default) | always | never
+MAP_MODE = os.environ.get("EXPLORER_BUILD_MAP", "auto").strip().lower()
+if MAP_MODE == "1":       # older flag value
+    MAP_MODE = "always"
+elif MAP_MODE in ("0", ""):
+    MAP_MODE = "auto"
 MAP_PROVIDER = os.environ.get("EXPLORER_MAP_PROVIDER", "local")
+
+
+async def _should_build_map(path: str) -> tuple[bool, str]:
+    """(build?, reason) — reason is surfaced so the choice is never silent."""
+    if MAP_MODE == "never":
+        return False, "disabled (EXPLORER_BUILD_MAP=never)"
+    info = _first_json_block(await client.call_tool("pdf_info", {"path": path}))
+    if not isinstance(info, dict) or info.get("error"):
+        return False, f"pdf_info failed: {(info or {}).get('error')}"
+    toc = info.get("toc") or []
+    entries = int(info.get("toc_entry_count") or 0)
+    pages = int(info.get("page_count") or 0)
+    if MAP_MODE == "always":
+        return True, "forced (EXPLORER_BUILD_MAP=always)"
+    # pdf_info inlines `toc` only when the entry count is small; a large TOC is
+    # itself proof the document is navigable, so no second call is needed.
+    if entries > 50:
+        return False, f"TOC is navigable ({entries} entries) — pdf_get_toc suffices"
+    if summarizer.toc_is_navigable(toc, pages):
+        return False, f"TOC is navigable ({entries} entries) — pdf_get_toc suffices"
+    return True, f"TOC unusable ({entries} entries) — generating an index"
 
 
 async def _cache_counters() -> tuple[int, int]:
@@ -392,7 +425,10 @@ async def _warm_document(path: str, total_pages: int) -> None:
         publish()
         return
 
-    if BUILD_MAP:
+    build_map, why = await _should_build_map(path)
+    state["map_decision"] = why
+    publish()
+    if build_map:
         state["phase"] = "mapping"
         state["eta"] = None
         publish()
@@ -506,8 +542,9 @@ async def api_warm_status() -> dict[str, Any]:
 async def api_map(path: str) -> dict[str, Any]:
     data = summarizer.load_map(path)
     if not data:
-        return {"present": False, "enabled": BUILD_MAP}
-    return {"present": True, "enabled": BUILD_MAP, "map": data,
+        build, why = await _should_build_map(path)
+        return {"present": False, "mode": MAP_MODE, "would_build": build, "reason": why}
+    return {"present": True, "mode": MAP_MODE, "map": data,
             "prompt_block": summarizer.render_for_prompt(data)}
 
 
@@ -518,12 +555,64 @@ async def api_build_map(body: WarmRequest) -> dict[str, Any]:
     if not isinstance(info, dict) or info.get("error"):
         raise HTTPException(status_code=400,
                             detail=(info or {}).get("error", "cannot read that PDF"))
-    data = await summarizer.build_core_map(
-        body.path, int(info["page_count"]), client.call_tool, _first_json_block,
-        provider=MAP_PROVIDER)
-    summarizer.save_map(data)
-    return {"chapters": len(data["chapters"]), "elapsed": data["elapsed"],
-            "topics": len(data["topics"])}
+    # Built in the background: a 453-page book takes minutes, and a synchronous
+    # handler dies with the client's request (a curl timeout cancelled the task
+    # and silently produced no map). Progress arrives on the SSE channel.
+    async def build() -> None:
+        try:
+            data = await summarizer.build_core_map(
+                body.path, int(info["page_count"]), client.call_tool, _first_json_block,
+                provider=MAP_PROVIDER,
+                on_progress=lambda done, total, label: client._publish(
+                    "map", {"path": body.path, "done": done, "total": total,
+                            "label": label, "state": "running"}))
+            summarizer.save_map(data)
+            client._publish("map", {"path": body.path, "state": "done",
+                                    "chapters": len(data["chapters"]),
+                                    "topics": len(data["topics"]),
+                                    "elapsed": data["elapsed"]})
+        except Exception as exc:
+            client._publish("map", {"path": body.path, "state": "failed",
+                                    "message": str(exc)})
+
+    asyncio.create_task(build())
+    return {"status": "started", "pages": info["page_count"]}
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    voice: str | None = None
+    speed: float | None = None
+
+
+@app.get("/api/voice")
+async def api_voice_status(request: Request) -> dict[str, Any]:
+    """Both directions of voice: TTS via this backend, STT straight from the page.
+
+    The STT endpoint depends on how the page was reached. Served directly, the
+    browser can hit stt_server on loopback. Served through the reverse proxy the
+    page is on https and cannot reach 127.0.0.1:2700 at all (wrong host, and
+    mixed content), so it must use the proxy's own /stt/socket.io route on the
+    page origin — the same path cv uses. Detected from forwarding headers so
+    neither deployment needs configuring.
+    """
+    tts = await voice.health()
+    proxied = bool(request.headers.get("x-forwarded-host")
+                   or request.headers.get("x-forwarded-proto"))
+    if proxied:
+        stt = {"url": "", "path": "/stt/socket.io", "mode": "proxy"}
+    else:
+        stt = {"url": os.environ.get("EXPLORER_STT_URL", "http://127.0.0.1:2700"),
+               "path": "/socket.io", "mode": "direct"}
+    return {"tts": tts, "stt": stt}
+
+
+@app.post("/api/speak")
+async def api_speak(body: SpeakRequest) -> dict[str, Any]:
+    result = await voice.synthesize(body.text, body.voice, body.speed)
+    if result.get("error") and not result["chunks"]:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
 
 
 @app.get("/api/document")

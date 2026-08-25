@@ -78,6 +78,30 @@ export class DocumentViewer {
         this._pdfControls = null;
     }
 
+    /** Force one page (and its neighbours) to rasterise now.
+     *
+     *  Jumping to a citation must not land on a blank placeholder: lazy
+     *  rendering only fires when the IntersectionObserver reports the page
+     *  visible, which can lag the scroll or never fire at all. A highlight
+     *  painted over an unrendered page looks like no highlight at all. */
+    primePage(pageNo, radius = 1) {
+        const renderer = this._pdfRenderer;
+        if (!renderer || !this._pdfDoc || !this._innerDiv) return 0;
+        const pageDivs = renderer.pdfPageDivs || [];
+        let queued = 0;
+        for (let n = pageNo - radius; n <= pageNo + radius; n++) {
+            const pageDiv = pageDivs[n - 1];
+            if (!pageDiv) continue;
+            if (pageDiv._renderState === 'rendered' || pageDiv._renderState === 'rendering') continue;
+            renderer._enqueueRender(pageDiv);
+            queued++;
+        }
+        if (queued) {
+            renderer._processRenderQueue(this._pdfDoc, this._innerDiv, renderer._renderVersion);
+        }
+        return queued;
+    }
+
     /** Re-rasterise all rendered pages (used after a crispness change). */
     rerenderAll() {
         return this._pdfRenderer?.rerenderAll?.() ?? 0;
@@ -235,9 +259,39 @@ export class DocumentViewer {
             scrollHost.scrollTop += targetRect.top - hostRect.top;
         }
 
+        this.primePage(regions[0].page_no || 1);
+
         for (const r of regions) {
-            this._paintBboxOnPage(r.page_no, r.bbox);
+            if (Array.isArray(r.bbox) && r.bbox.length === 4) {
+                this._paintBboxOnPage(r.page_no, r.bbox);
+            } else {
+                // pdf_search omits bbox for snippet-style matches (excerpts that
+                // begin mid-block) and for cross-page hits. Previously these
+                // produced no visual feedback whatsoever. There is no position
+                // to point at, so mark the whole page instead of pretending to
+                // a precision we do not have.
+                this._paintWholePage(r.page_no);
+            }
         }
+    }
+
+    /** Mark an entire page, for a citation with no positional information. */
+    _paintWholePage(pageNo) {
+        const pageDivs = this._pdfRenderer?.pdfPageDivs;
+        const pageDiv = pageDivs && pageDivs[pageNo - 1];
+        if (!pageDiv) return;
+        const layer = document.createElement('div');
+        layer.className = 'pdf-bbox-highlight-layer';
+        layer.style.cssText = 'width:100%;height:100%;transform:none;';
+        const rect = document.createElement('div');
+        rect.className = 'pdf-bbox-highlight page-level';
+        rect.style.cssText = 'left:0;top:0;width:100%;height:100%;';
+        rect.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            this.clearBboxHighlights();
+        });
+        layer.appendChild(rect);
+        pageDiv.appendChild(layer);
     }
 
     /** Dismiss every highlight currently painted anywhere in the

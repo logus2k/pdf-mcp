@@ -1,0 +1,75 @@
+services:
+  pdf-mcp-explorer:
+    profiles:
+      - default
+      - full
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: logus2k/pdf-mcp-explorer
+    container_name: pdf-mcp-explorer
+    hostname: pdf-mcp-explorer
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Published on the host so the existing proxy entry keeps working
+    # unchanged: nginx proxies to host.docker.internal:8090, which resolves to
+    # the host port below. Reaching the container by service name would have
+    # meant editing nginx.conf.
+    ports:
+      - "8090:8090"
+
+    networks:
+      logus2k_network:
+        ipv4_address: 172.20.0.112
+
+    # The local LLM (llama.cpp) runs on the host, not in this network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+      EXPLORER_HOST: "0.0.0.0"
+      EXPLORER_PORT: "8090"
+
+      # Models are discovered at request time from this endpoint; no model name
+      # is pinned here, so swapping the served model needs no change.
+      EXPLORER_LLM_BASE: "http://host.docker.internal:8500/v1"
+
+      # tts_server shares logus2k_network, so it is reachable by service name.
+      EXPLORER_TTS_URL: "http://tts_server:7700"
+
+      # Answer length. 2000 was cutting answers mid-sentence.
+      EXPLORER_MAX_TOKENS: "32768"
+
+      # Core-map generation: build one only for documents whose own table of
+      # contents cannot navigate them. Measured to help there and to hurt on
+      # documents with a real TOC.
+      EXPLORER_BUILD_MAP: "auto"
+
+      # Set to use the Claude provider; absent, it shows as unavailable and the
+      # local models still work.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+    volumes:
+      # Documents. Read-write: the Upload button writes here, and the path
+      # matches the allow-list in docker/pdf-mcp-config.toml.
+      - ~/env/assets/pdf-mcp/data:/documents
+
+      # pdf-mcp's SQLite cache (extracted text, FTS index, page embeddings).
+      # Named volume so a rebuild does not throw away ~50s of indexing per
+      # large document. Keyed on path+mtime, so it self-invalidates.
+      - pdf_mcp_cache:/root/.cache/pdf-mcp
+
+      # Generated document maps, same reasoning.
+      - pdf_mcp_maps:/root/.cache/pdf-mcp-explorer
+
+volumes:
+  pdf_mcp_cache:
+  pdf_mcp_maps:
+
+networks:
+  logus2k_network:
+    external: true

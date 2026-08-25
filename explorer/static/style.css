@@ -1,50 +1,57 @@
 :root {
-  --bg: #f6f7f9;
-  --panel: #ffffff;
-  --panel-2: #f0f2f5;
-  --ink: #14181f;
-  --ink-soft: #5a6572;
-  --line: #dfe3e8;
-  --accent: #2f6feb;
-  --accent-ink: #ffffff;
-  --ok: #1f9d55;
-  --warn: #b7791f;
-  --err: #d64545;
+  /* Light. Supplied ramp #D4F1F4 #C8E6F0 #B0D8EC #75C0E0 #3D9AC9 drives the
+     desktop, borders and accent; panels are near-white so document text and
+     chat prose read cleanly against them.
+     Ink is not from the ramp — the ramp's darkest is 2.65:1 on its lightest,
+     under the 4.5:1 body-text floor. Measured on --panel: ink 15.3:1,
+     muted 6.7:1, err 6.1:1, ok 4.9:1. */
+  --bg: #B0D8EC;
+  --panel: #f2f8f9;
+  --panel-2: #f5f5f5;
+  --ink: #06222E;
+  --ink-soft: #3A5C69;
+  --line: #75C0E0;
+  --accent: #3D9AC9;
+  --accent-ink: #06222E;
+  --ok: #1f7a52;
+  --err: #b3261e;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --radius: 10px;
-}
-
-:root[data-theme="dark"],
-:root:not([data-theme="light"]) {
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0f1216;
-    --panel: #161a20;
-    --panel-2: #1c2129;
-    --ink: #e7ebf0;
-    --ink-soft: #98a3b1;
-    --line: #262c35;
-    --accent: #5b93ff;
-    --accent-ink: #08101f;
+    /* Dark — supplied 5-colour ramp.
+       #0D0D0D #262626 #404040 #737373 #E6E6E6
+       --panel is #1A1A1A, interpolated between ramp steps 1 and 2 so page,
+       panel and inset stay distinguishable. Muted text is lightened to
+       #A6A6A6 (7.2:1); the ramp's #737373 scores 3.67:1, under AA for small
+       text. Accent is carried over from the light ramp so the two themes
+       share an identity — 8.6:1 on panel. */
+    --bg: #0D0D0D;
+    --panel: #1A1A1A;
+    --panel-2: #262626;
+    --ink: #E6E6E6;
+    --ink-soft: #A6A6A6;
+    --line: #404040;
+    --accent: #75C0E0;
+    --accent-ink: #06222E;
     --ok: #4ac97e;
-    --warn: #e0b155;
     --err: #ff7b72;
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #0f1216;
-  --panel: #161a20;
-  --panel-2: #1c2129;
-  --ink: #e7ebf0;
-  --ink-soft: #98a3b1;
-  --line: #262c35;
-  --accent: #5b93ff;
-  --accent-ink: #08101f;
+  --bg: #0D0D0D;
+  --panel: #1A1A1A;
+  --panel-2: #262626;
+  --ink: #E6E6E6;
+  --ink-soft: #A6A6A6;
+  --line: #404040;
+  --accent: #75C0E0;
+  --accent-ink: #06222E;
   --ok: #4ac97e;
   --warn: #e0b155;
   --err: #ff7b72;

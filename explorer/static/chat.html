@@ -3,18 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>pdf-mcp Chat</title>
-  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css" />
-  <link rel="stylesheet" href="/static/pdf-viewer.css" />
-  <link rel="stylesheet" href="/static/document-viewer.css" />
-  <link rel="stylesheet" href="/static/chat.css" />
+  <title>pdf-mcp</title>
+  <link rel="stylesheet" href="static/vendor/katex/katex.min.css" />
+  <link rel="stylesheet" href="static/pdf-viewer.css" />
+  <link rel="stylesheet" href="static/document-viewer.css" />
+  <link rel="stylesheet" href="static/chat.css" />
 </head>
 <body class="chat-body">
   <header class="topbar">
     <div class="brand">
       <span class="dot" id="health-dot"></span>
-      <h1>pdf-mcp Chat</h1>
-      <span class="version" id="server-version">connecting…</span>
+      <h1>pdf-mcp</h1>
     </div>
     <div class="topbar-right">
       <label class="doc-picker">
@@ -29,7 +28,7 @@
         <span>Model</span>
         <select id="provider-select"></select>
       </label>
-      <a class="linkbtn" href="/tools">Tools ↗</a>
+      <a class="linkbtn" href="tools">Tools ↗</a>
       <button id="theme-toggle" type="button" title="Toggle theme">◐</button>
     </div>
   </header>
@@ -72,6 +71,7 @@
       <form class="composer" id="composer">
         <textarea id="chat-input" rows="1" placeholder="Ask a question about the document…"></textarea>
         <button type="submit" id="send-btn" class="primary">Send</button>
+        <button type="button" id="mic-btn" class="ghost" title="Dictate (speech to text)">🎤</button>
         <button type="button" id="stop-btn" class="ghost" hidden>Stop</button>
       </form>
       <div class="composer-note" id="composer-note"></div>
@@ -97,11 +97,12 @@
     <span class="st" id="st-cache" title="pdf-mcp cache across all documents">cache —</span>
   </footer>
 
-  <script src="/static/vendor/marked.min.js"></script>
-  <script src="/static/vendor/highlight/highlight.min.js"></script>
-  <script src="/static/vendor/katex/katex.min.js"></script>
-  <script src="/static/vendor/katex/katex-auto-render.min.js"></script>
-  <script src="/static/vendor/split/split.min.js"></script>
-  <script type="module" src="/static/chat.js"></script>
+  <script src="static/vendor/marked.min.js"></script>
+  <script src="static/vendor/highlight/highlight.min.js"></script>
+  <script src="static/vendor/katex/katex.min.js"></script>
+  <script src="static/vendor/katex/katex-auto-render.min.js"></script>
+  <script src="static/vendor/split/split.min.js"></script>
+  <script src="static/vendor/socket.io.min.js"></script>
+  <script type="module" src="static/chat.js"></script>
 </body>
 </html>

@@ -13,6 +13,7 @@ import { DocumentViewer } from "./viewer.js";
 import { SUPERSAMPLE_KEY, readSupersample } from "./pdf-renderer.js";
 import { ThinkingParser } from "./thinking.js";
 import { renderMarkdown, applyMarkdownExtras, escapeHtml } from "./markdown.js";
+import { speak, stopSpeaking, startListening, stopListening, isListening } from "./voice.js";
 
 const el = (id) => document.getElementById(id);
 
@@ -101,7 +102,7 @@ async function openDocument(path) {
   state.document = path;
   el("viewer-empty")?.remove();
   updateDocStatus(path);
-  const url = `/api/document?path=${encodeURIComponent(path)}`;
+  const url = `api/document?path=${encodeURIComponent(path)}`;
   try {
     await state.viewer.show({ url });
     trace("viewer.show DONE", seq,
@@ -125,7 +126,7 @@ async function loadToc(path) {
   const list = el("toc-list");
   list.textContent = "";
   try {
-    const res = await fetch("/api/call", {
+    const res = await fetch("api/call", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "pdf_get_toc", arguments: { path } }),
@@ -162,13 +163,10 @@ async function loadToc(path) {
 
 function jumpToPage(page, bbox) {
   if (!state.viewer || !page) return;
-  const regions = [{ page_no: page, bbox: bbox || null }];
-  if (bbox) {
-    state.viewer.showBboxHighlights(regions);
-  } else {
-    state.viewer.showBboxHighlights([{ page_no: page, bbox: [0, 0, 1, 1] }]);
-    state.viewer.clearBboxHighlights();
-  }
+  // A null bbox is passed through deliberately: the viewer marks the whole
+  // page. The previous paint-then-clear produced no feedback at all, which
+  // read as "the citation is broken".
+  state.viewer.showBboxHighlights([{ page_no: page, bbox: bbox || null }]);
 }
 
 /* ---------------- chat rendering ---------------- */
@@ -300,7 +298,7 @@ async function send(question) {
   };
 
   try {
-    const res = await fetch("/api/chat", {
+    const res = await fetch("api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -377,6 +375,19 @@ async function send(question) {
         } else if (event.type === "tool_error") {
           const chip = assistant.wrap.querySelector(`.toolchip.running[data-tool="${event.tool}"]`);
           if (chip) { chip.classList.remove("running"); chip.classList.add("failed"); }
+        } else if (event.type === "answer" && event.truncated) {
+          // The model hit the output cap: say so rather than leaving a
+          // sentence dangling with no explanation.
+          const tail = parser.flush();
+          if (tail) answer += tail;
+          if (event.content && !answer) answer = event.content;
+          paintAnswer();
+          const box = document.createElement("div");
+          box.className = "chat-error";
+          box.textContent =
+            "Answer stopped at the output limit (EXPLORER_MAX_TOKENS). " +
+            "Ask a narrower question, or raise the limit.";
+          assistant.wrap.appendChild(box);
         } else if (event.type === "answer") {
           const tail = parser.flush();
           if (tail) answer += tail;
@@ -394,7 +405,10 @@ async function send(question) {
 
     const tail = parser.flush();
     if (tail) { answer += tail; paintAnswer(); }
-    if (answer) state.history.push({ role: "assistant", content: answer });
+    if (answer) {
+      state.history.push({ role: "assistant", content: answer });
+      addSpeakButton(assistant.wrap, answer);
+    }
   } catch (err) {
     if (err.name !== "AbortError") {
       const box = document.createElement("div");
@@ -416,10 +430,24 @@ async function send(question) {
   }
 }
 
+function addSpeakButton(wrap, text) {
+  if (!state.voice?.tts?.available) return;   // no button if TTS is not reachable
+  const row = document.createElement("div");
+  row.className = "answer-actions";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "speak-btn";
+  btn.title = "Read this answer aloud";
+  btn.textContent = "🔊";
+  btn.addEventListener("click", () => speak(text, btn));
+  row.appendChild(btn);
+  wrap.appendChild(row);
+}
+
 /* ---------------- chrome ---------------- */
 
 async function loadDocuments() {
-  const res = await fetch("/api/documents");
+  const res = await fetch("api/documents");
   const data = await res.json();
   state.files = data.files || [];
   const select = el("doc-select");
@@ -453,7 +481,7 @@ async function loadDocuments() {
 }
 
 async function loadProviders() {
-  const res = await fetch("/api/providers");
+  const res = await fetch("api/providers");
   const data = await res.json();
   const select = el("provider-select");
   select.textContent = "";
@@ -527,7 +555,7 @@ function startViewerReadouts() {
 
 async function refreshCacheStatus() {
   try {
-    const res = await fetch("/api/call", {
+    const res = await fetch("api/call", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "pdf_cache_stats", arguments: {} }),
@@ -624,7 +652,7 @@ async function uploadDocument(input) {
     const form = new FormData();
     form.append("file", file, file.name);
 
-    const res = await fetch("/api/upload", { method: "POST", body: form });
+    const res = await fetch("api/upload", { method: "POST", body: form });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `upload failed (${res.status})`);
 
@@ -652,7 +680,7 @@ async function uploadDocument(input) {
 /* Live document changes pushed by the backend's folder watcher, so a PDF
  * dropped into the folder by any other means shows up without a reload. */
 function startDocumentWatch() {
-  const source = new EventSource("/api/events");
+  const source = new EventSource("api/events");
   state.events = source;
   source.onmessage = (evt) => {
     let payload;
@@ -670,16 +698,15 @@ function startDocumentWatch() {
 
 async function pollHealth() {
   try {
-    const res = await fetch("/api/health");
+    const res = await fetch("api/health");
     const data = await res.json();
     el("health-dot").classList.toggle("ok", data.status === "ok");
     const s = data.server || {};
-    el("server-version").textContent = `${s.name || "pdf-mcp"} ${s.version || ""}`;
+    // Version/pid live only in the status bar now; the header is just the name.
     status.conn(`${s.name || "pdf-mcp"} ${s.version || ""} · pid ${data.pid}`,
                 data.status === "ok" ? "ok" : "down");
   } catch (err) {
     el("health-dot").classList.add("down");
-    el("server-version").textContent = "backend unreachable";
     status.conn("backend unreachable", "down");
   }
 }
@@ -770,6 +797,46 @@ async function boot() {
     }
   });
   el("stop-btn").addEventListener("click", () => state.abort?.abort());
+
+  try {
+    state.voice = await (await fetch("api/voice")).json();
+    trace("voice", state.voice);
+  } catch (err) {
+    state.voice = { tts: { available: false }, stt: null };
+  }
+
+  const micBtn = el("mic-btn");
+  if (!state.voice?.stt) {
+    micBtn.hidden = true;
+  } else {
+    micBtn.addEventListener("click", async () => {
+      const note = el("composer-note");
+      if (isListening()) {
+        stopListening();
+        micBtn.classList.remove("listening");
+        note.textContent = "";
+        return;
+      }
+      try {
+        micBtn.classList.add("listening");
+        note.className = "composer-note ok";
+        note.textContent = "listening…";
+        await startListening(state.voice.stt, (text) => {
+          // Append rather than replace: stt_server emits partial utterances.
+          const input = el("chat-input");
+          input.value = (input.value ? input.value + " " : "") + text;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }, (status) => { note.textContent = status; });
+      } catch (err) {
+        micBtn.classList.remove("listening");
+        note.className = "composer-note";
+        note.textContent = `microphone: ${err.message || err}`;
+      }
+    });
+  }
+
+  // Speaking should not continue over a new question.
+  el("composer").addEventListener("submit", () => stopSpeaking());
 
   const uploadInput = el("upload-input");
   el("upload-btn").addEventListener("click", () => uploadInput.click());

@@ -36,7 +36,14 @@ CLAUDE_BASE = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 CLAUDE_MODEL = os.environ.get("EXPLORER_CLAUDE_MODEL", "claude-sonnet-5")
 CLAUDE_VERSION = "2023-06-01"
 
-MAX_TOKENS = int(os.environ.get("EXPLORER_MAX_TOKENS", "2000"))
+# Output cap per LLM call. 2000 was cutting real answers mid-sentence
+# (finish_reason "length" at exactly 2000 completion tokens) with nothing shown
+# to the reader. The local slot is 64K (--ctx-size 131072 / --parallel 2), and
+# input — system prompt, 13 tool schemas, history, tool results — typically runs
+# ~10K, so 32K of output still leaves headroom. llama.cpp clamps to whatever
+# context actually remains, so an unusually long input degrades rather than
+# erroring.
+MAX_TOKENS = int(os.environ.get("EXPLORER_MAX_TOKENS", "32768"))
 REQUEST_TIMEOUT = httpx.Timeout(900.0, connect=15.0)
 
 

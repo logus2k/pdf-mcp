@@ -1,2 +1,8 @@
+# Explorer backend. pdf-mcp itself is a separate install (see Dockerfile) so the
+# MCP server and this app keep independent dependency trees, exactly as they do
+# on the host with two virtualenvs.
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
+python-multipart
+python-socketio[asyncio_client]

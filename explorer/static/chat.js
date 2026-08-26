@@ -36,6 +36,7 @@ const state = {
   streaming: false,
   abort: null,
   activeCitation: null,
+  myUploads: new Set(),   // paths this browser uploaded, so their progress shows
 };
 
 /* ---------------- viewer ---------------- */
@@ -102,6 +103,7 @@ async function openDocument(path) {
   state.document = path;
   el("viewer-empty")?.remove();
   updateDocStatus(path);
+  syncWarmState();   // this document may already be indexing
   const url = `api/document?path=${encodeURIComponent(path)}`;
   try {
     await state.viewer.show({ url });
@@ -594,6 +596,12 @@ let _warmHideTimer = null;
 function renderWarm(p) {
   const slot = el("st-warm");
   if (!slot) return;
+  // Warm events are broadcast to every connected browser. Showing them all
+  // meant another session's upload hijacked this one's status bar while the
+  // reader was looking at a different document. Only report progress for the
+  // document being viewed, or one this browser uploaded itself.
+  const mine = p.path && (p.path === state.document || state.myUploads.has(p.path));
+  if (!mine) return;
   const total = p.total || 0;
   const units = (p.text_done || 0) + (p.emb_done || 0);
   const pct = total ? Math.min(100, Math.round((units / (2 * total)) * 100)) : 0;
@@ -656,6 +664,7 @@ async function uploadDocument(input) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `upload failed (${res.status})`);
 
+    state.myUploads.add(data.path);
     await loadDocuments();
     el("doc-select").value = data.path;
     await openDocument(data.path);
@@ -679,9 +688,24 @@ async function uploadDocument(input) {
 
 /* Live document changes pushed by the backend's folder watcher, so a PDF
  * dropped into the folder by any other means shows up without a reload. */
+/* SSE is fire-and-forget: events fired before this page connected, or during a
+ * reconnect, are gone for good. Ask the server what is in flight so a tab
+ * opened mid-indexing (or one whose stream dropped) still shows the bar. */
+async function syncWarmState() {
+  try {
+    const res = await fetch("api/warm");
+    const data = await res.json();
+    for (const w of data.warming || []) {
+      if (w.state === "running") renderWarm(w);
+    }
+  } catch (err) { /* nothing in flight, or backend down; health poll reports it */ }
+}
+
 function startDocumentWatch() {
   const source = new EventSource("api/events");
   state.events = source;
+  // Catch up on open, and again whenever the stream re-establishes.
+  source.onopen = () => syncWarmState();
   source.onmessage = (evt) => {
     let payload;
     try { payload = JSON.parse(evt.data); } catch (e) { return; }

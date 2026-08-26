@@ -167,6 +167,22 @@ async def run_agent(
     """Drive the LLM/tool loop, yielding events for the browser as they happen."""
     tools = select_tools(mcp_tools, all_tools=all_tools)
     system = SYSTEM_PROMPT
+    if any(t["name"] == "pdf_semantic_search" for t in tools):
+        # Only stated when the tool is actually offered — this document has a
+        # chunked index. Without this the model never reaches for it: pdf_search
+        # almost always returns *something*, so "use it when keyword search
+        # fails" (the tool's own description) never triggers, and the semantic
+        # index sits unused. Measured: four paraphrased questions in a row, all
+        # answered from pdf_search alone.
+        system += (
+            "\n\nThis document also has pdf_semantic_search, which matches by "
+            "meaning rather than exact words and covers the full text of every "
+            "page. Use it in addition to pdf_search whenever the question "
+            "paraphrases the document rather than quoting it, asks about a "
+            "concept, or when pdf_search's matches read as off-topic. Running "
+            "both and merging what they find is the stronger answer; they "
+            "return different passages."
+        )
     if document:
         system += (
             f"\n\nThe user is currently viewing this document:\n{document}\n"

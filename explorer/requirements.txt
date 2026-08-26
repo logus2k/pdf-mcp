@@ -6,3 +6,4 @@ uvicorn[standard]
 httpx
 python-multipart
 python-socketio[asyncio_client]
+pymupdf

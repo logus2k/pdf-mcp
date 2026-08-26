@@ -41,6 +41,12 @@ services:
       # tts_server shares logus2k_network, so it is reachable by service name.
       EXPLORER_TTS_URL: "http://tts_server:7700"
 
+      # Chunked semantic index. bge-m3 is served by llama.cpp on the host: it
+      # takes 4,096 tokens per request against bge-small's 512, so whole pages
+      # are covered instead of their first third.
+      EXPLORER_EMBED_URL: "http://host.docker.internal:8500/v1/embeddings"
+      EXPLORER_EMBED_MODEL: "bge-m3"
+
       # Answer length. 2000 was cutting answers mid-sentence.
       EXPLORER_MAX_TOKENS: "32768"
 

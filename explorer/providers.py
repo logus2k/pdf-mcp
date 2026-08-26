@@ -91,6 +91,10 @@ async def discover_local_models() -> list[dict[str, Any]]:
             "id": model_id,
             "state": status.get("value"),
             "context": context,
+            # Slots the router will serve concurrently for this model. Callers
+            # that fan out (map generation) size their batch from this rather
+            # than guessing, so raising --parallel speeds them up for free.
+            "parallel": parallel,
             # A router slot gets ctx-size/parallel, which is the real per-request budget.
             "slot_context": (context // parallel) if context else None,
         })
@@ -421,6 +425,17 @@ async def stream_claude(
             return
 
     yield {"type": "done", "stop_reason": stop_reason}
+
+
+async def slots_for(provider: str) -> int:
+    """How many requests this provider will genuinely serve at once."""
+    name, _, model = (provider or "local").partition(":")
+    if name == "claude":
+        return int(os.environ.get("EXPLORER_CLAUDE_CONCURRENCY", "4"))
+    for entry in await discover_local_models():
+        if not model or entry["id"] == model:
+            return max(1, int(entry.get("parallel") or 1))
+    return 1
 
 
 def stream(provider: str, history, tools, system):

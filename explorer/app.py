@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 import agent
 import providers
+import semantic
 import summarizer
 import voice
 
@@ -212,6 +213,13 @@ async def _watch_documents(roots: list[str], interval: float = 2.0) -> None:
             ]
             if previous is not None and current != previous:
                 client._publish("documents", {"count": len(current)})
+                # Warm anything new. Without this a PDF copied into the folder
+                # stays cold until someone asks about it, and pays for the
+                # indexing mid-question.
+                seen = {p for p, _, _ in previous}
+                for path, _, _ in current:
+                    if path not in seen:
+                        enqueue_warm(path, WARM_DISCOVERED)
             previous = current
         except Exception as exc:  # a transient stat error must not kill the task
             client._publish("error", {"tool": "watch", "message": str(exc)})
@@ -227,10 +235,17 @@ async def lifespan(app: FastAPI):
     info = _first_json_block(await client.call_tool("server_info", {}))
     roots = info.get("documents", {}).get("roots", []) if isinstance(info, dict) else []
     watcher = asyncio.create_task(_watch_documents(roots))
+    warmer = asyncio.create_task(_warm_worker())
+    # Index whatever is already in the folder. Cheap when the cache is warm
+    # (~11ms per document), and it is what makes a cleared cache recover on its
+    # own instead of ambushing the next question.
+    for existing in _scan_roots(roots):
+        enqueue_warm(existing["path"], WARM_STARTUP)
     try:
         yield
     finally:
         watcher.cancel()
+        warmer.cancel()
         await client.stop()
 
 
@@ -264,8 +279,25 @@ async def api_chat(body: ChatRequest) -> StreamingResponse:
     whole conversation; EventSource can only issue GETs.
     """
     tools = await client.list_tools()
+    if body.document and semantic.is_indexed(body.document):
+        tools = tools + [semantic.TOOL_SCHEMA]
 
     async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # pdf_semantic_search is served here, not by pdf-mcp: it queries the
+        # chunked bge-m3 index, which covers whole pages instead of the first
+        # 512 tokens. Shaped like a pdf_search result so citations, page jumps
+        # and bbox highlighting work unchanged.
+        if name == "pdf_semantic_search":
+            hits = await semantic.search(
+                arguments.get("path") or body.document or "",
+                arguments.get("query", ""),
+                int(arguments.get("max_results") or 8))
+            payload = {"matches": [
+                {"page": h["page"], "excerpt": h["excerpt"][:1200],
+                 "score": h["score"], "bbox": h["bbox"]}
+                for h in hits], "total_matches": len(hits),
+                "search_mode": "semantic-chunked-bge-m3"}
+            return {"content": [{"type": "text", "text": json.dumps(payload)}]}
         return await client.call_tool(name, arguments)
 
     # `use_map=False` lets a caller A/B the map's effect on the same question.
@@ -317,6 +349,48 @@ async def tools_page() -> FileResponse:
 # ---------------------------------------------------------------------------
 
 warm_state: dict[str, Any] = {}
+
+# Warming is queued and served by one worker. Every document must be indexed
+# before it can be searched at full speed, and that cost used to land on the
+# reader's first question: 56s on a 115-page document, with no progress shown,
+# because only *uploads* were warmed. Documents copied into the folder, and
+# everything present at startup (or after a cache wipe), were never touched.
+#
+# Priorities: an upload is what someone is waiting on, so it goes first; a
+# newly-discovered file next; the startup sweep last. Re-warming an already
+# indexed document costs ~11ms, so the sweep is cheap when the cache is warm.
+WARM_UPLOAD, WARM_DISCOVERED, WARM_STARTUP = 0, 1, 2
+warm_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+_warm_seq = 0
+
+
+def enqueue_warm(path: str, priority: int = WARM_DISCOVERED) -> None:
+    global _warm_seq
+    existing = warm_state.get(path, {})
+    if existing.get("state") in ("running", "done"):
+        return
+    _warm_seq += 1
+    warm_queue.put_nowait((priority, _warm_seq, path))
+
+
+async def _warm_worker() -> None:
+    """Serialise warming: two documents embedding at once would just contend."""
+    while True:
+        _, _, path = await warm_queue.get()
+        try:
+            if warm_state.get(path, {}).get("state") == "done":
+                continue
+            if not Path(path).is_file():
+                continue
+            info = _first_json_block(await client.call_tool("pdf_info", {"path": path}))
+            if not isinstance(info, dict) or info.get("error"):
+                continue
+            await _warm_document(path, int(info["page_count"]))
+        except Exception as exc:
+            client._publish("warm", {"path": path, "name": Path(path).name,
+                                     "state": "failed", "message": str(exc)})
+        finally:
+            warm_queue.task_done()
 
 # Core-map generation is conditional by default. Measured over 144 A/B turns:
 # the map HURTS on documents with a usable table of contents (pdf_get_toc is
@@ -406,19 +480,55 @@ async def _warm_document(path: str, total_pages: int) -> None:
                 state["eta"] = round(((total_pages - last) / rate) + (total_pages / rate) * 0.33, 1)
             publish()
 
+        # Chunked semantic index (bge-m3). This is the semantic half that
+        # actually covers the whole page; pdf-mcp's own embeddings truncate at
+        # 512 tokens and are left to serve only its internal hybrid scoring.
+        state["phase"] = "semantic"
+        state["eta"] = None
+        publish()
+        try:
+            pages_payload = _first_json_block(await client.call_tool(
+                "pdf_read_pages", {"path": path, "pages": f"1-{total_pages}"}))
+            page_list = (pages_payload or {}).get("pages", [])
+
+            def _chunk_progress(done: int, total: int) -> None:
+                state["chunks_done"], state["chunks_total"] = done, total
+                publish()
+
+            result = await semantic.index_document(path, page_list, _chunk_progress)
+            state["chunks"] = result.get("chunks")
+            state["chunks_with_bbox"] = result.get("with_bbox")
+        except Exception as exc:
+            state["semantic_error"] = str(exc)
+        publish()
+
         state["phase"] = "embedding"
         state["eta"] = None
         publish()
-        for _ in range(30):
-            result = _first_json_block(await client.call_tool(
-                "pdf_corpus_warm",
-                {"paths": [path], "embeddings": True, "budget_seconds": 55},
-            ))
-            _, emb_now = await _cache_counters()
-            state["emb_done"] = min(total_pages, emb_now)
-            publish()
-            if not isinstance(result, dict) or not result.get("unprocessed"):
-                break
+
+        # Embeddings are committed in bulk by pdf_corpus_warm, so there is no
+        # count to report and nothing publishes between its calls — the bar sat
+        # frozen through the longest phase. A ticker keeps elapsed moving so the
+        # UI shows work in progress rather than a stall.
+        async def _tick() -> None:
+            while True:
+                await asyncio.sleep(2)
+                publish()
+
+        ticker = asyncio.create_task(_tick())
+        try:
+            for _ in range(30):
+                result = _first_json_block(await client.call_tool(
+                    "pdf_corpus_warm",
+                    {"paths": [path], "embeddings": True, "budget_seconds": 55},
+                ))
+                _, emb_now = await _cache_counters()
+                state["emb_done"] = min(total_pages, emb_now)
+                publish()
+                if not isinstance(result, dict) or not result.get("unprocessed"):
+                    break
+        finally:
+            ticker.cancel()
     except Exception as exc:
         state["state"] = "failed"
         state["message"] = str(exc)
@@ -505,7 +615,10 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
     client._publish("documents", {"count": len(_scan_roots(roots))})
     if pages and not error:
-        asyncio.create_task(_warm_document(str(destination), int(pages)))
+        # Highest priority: this is the document someone is waiting to use, and
+        # the status-bar progress bar tracks it through extraction, embeddings
+        # and (where applicable) map generation before reporting ready.
+        enqueue_warm(str(destination), WARM_UPLOAD)
     return {
         "path": str(destination),
         "name": destination.name,
@@ -615,6 +728,11 @@ async def api_speak(body: SpeakRequest) -> dict[str, Any]:
     return result
 
 
+@app.get("/api/semantic")
+async def api_semantic() -> dict[str, Any]:
+    return semantic.stats()
+
+
 @app.get("/api/document")
 async def api_document(path: str) -> FileResponse:
     """Serve a PDF to pdf.js — but only one the MCP server would itself admit.
@@ -643,6 +761,8 @@ def _is_within(candidate: Path, root: Path) -> bool:
 @app.get("/api/tools")
 async def api_tools() -> dict[str, Any]:
     tools = await client.list_tools()
+    if body.document and semantic.is_indexed(body.document):
+        tools = tools + [semantic.TOOL_SCHEMA]
     return {
         "tools": tools,
         "server": client.server_info.get("serverInfo", {}),

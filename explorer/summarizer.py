@@ -24,6 +24,7 @@ One final pass turns those objects into the framework digest.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -43,6 +44,11 @@ MAX_CHAPTERS = int(os.environ.get("EXPLORER_MAP_MAX_CHAPTERS", "40"))
 # Per-chapter text handed to the model. Chapters longer than this are sampled
 # head+tail rather than blindly truncated, and the model is told so.
 CHAPTER_CHAR_BUDGET = int(os.environ.get("EXPLORER_MAP_CHAPTER_CHARS", "18000"))
+# Chapters are indexed concurrently, sized to the slots the model server will
+# actually serve (llama.cpp --parallel). Sequential indexing left every slot but
+# one idle: 32 chapters at ~4s each ran 127s with half the machine unused.
+# 0 = discover from the provider.
+MAP_CONCURRENCY = int(os.environ.get("EXPLORER_MAP_CONCURRENCY", "0"))
 
 # Quality Rules from book-to-skill's SKILL.md, trimmed to the ones that bear on
 # a navigation map. Rule 2 (exact naming) is what makes the topic index usable;
@@ -236,33 +242,49 @@ async def build_core_map(
     toc = toc_result.get("toc", []) if isinstance(toc_result, dict) else []
     chapters, segmentation = _segment_chapters(toc, page_count, _want_source=True)
 
-    indexed: list[dict[str, Any]] = []
-    for i, chapter in enumerate(chapters, 1):
-        if on_progress:
-            on_progress(i - 1, len(chapters), chapter["title"])
+    slots = MAP_CONCURRENCY or await providers.slots_for(provider)
+    limit = asyncio.Semaphore(max(1, slots))
+    done = 0
+
+    async def index_chapter(chapter: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal done
+        # pdf_read_pages is cheap and already serialised over the one stdio
+        # pipe; only the LLM call is gated, since that is what the slots limit.
         pages = extract_json(await call_tool(
             "pdf_read_pages",
             {"path": pdf_path, "pages": f"{chapter['start']}-{chapter['end']}"}))
         text = "\n\n".join(p.get("text", "") for p in (pages or {}).get("pages", []))
         if not text.strip():
-            continue
-        try:
-            reply = await _ask(
-                provider, CHAPTER_PROMPT,
-                f"Chapter title: {chapter['title']}\n"
-                f"Pages {chapter['start']}-{chapter['end']}\n\n{_sample(text)}",
-                max_tokens=400)
-            parsed = _parse_json_object(reply)
-        except Exception as exc:
-            # One bad chapter must not lose the rest of the map.
-            parsed = {"one_line": f"(indexing failed: {exc})", "frameworks": [], "terms": []}
-        indexed.append({
+            done += 1
+            return None
+        async with limit:
+            try:
+                reply = await _ask(
+                    provider, CHAPTER_PROMPT,
+                    f"Chapter title: {chapter['title']}\n"
+                    f"Pages {chapter['start']}-{chapter['end']}\n\n{_sample(text)}",
+                    max_tokens=400)
+                parsed = _parse_json_object(reply)
+            except Exception as exc:
+                # One bad chapter must not lose the rest of the map.
+                parsed = {"one_line": f"(indexing failed: {exc})",
+                          "frameworks": [], "terms": []}
+        done += 1
+        if on_progress:
+            on_progress(done, len(chapters), chapter["title"])
+        return {
             "title": chapter["title"],
             "start": chapter["start"], "end": chapter["end"],
             "one_line": str(parsed.get("one_line") or "")[:300],
             "frameworks": [str(f)[:80] for f in (parsed.get("frameworks") or [])][:6],
             "terms": [str(t)[:60] for t in (parsed.get("terms") or [])][:10],
-        })
+        }
+
+    if on_progress:
+        on_progress(0, len(chapters), f"indexing with {slots} slot(s)")
+    # gather preserves order, so the chapter index stays in document order.
+    results = await asyncio.gather(*(index_chapter(c) for c in chapters))
+    indexed = [r for r in results if r]
 
     if on_progress:
         on_progress(len(chapters), len(chapters), "assembling")

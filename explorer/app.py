@@ -651,6 +651,28 @@ async def api_warm_status() -> dict[str, Any]:
     return {"warming": list(warm_state.values())}
 
 
+@app.get("/api/outline")
+async def api_outline(path: str) -> dict[str, Any]:
+    """Contents for the viewer panel: the PDF's own outline, or the printed one.
+
+    Many documents carry a full contents listing on their front-matter pages
+    and no embedded outline at all, so pdf_get_toc reports nothing and the
+    panel read "No outline in this PDF." while the listing sat on page 5. The
+    printed entries are recovered during warming and stored with the map.
+    """
+    result = await client.call_tool("pdf_get_toc", {"path": path})
+    payload = _first_json_block(result)
+    entries = (payload or {}).get("toc") or [] if isinstance(payload, dict) else []
+    if entries:
+        return {"source": "outline", "entries": entries}
+
+    stored = summarizer.load_map(path)
+    printed = (stored or {}).get("printed_toc") or []
+    if printed:
+        return {"source": "printed", "entries": printed}
+    return {"source": "none", "entries": []}
+
+
 @app.get("/api/map")
 async def api_map(path: str) -> dict[str, Any]:
     data = summarizer.load_map(path)

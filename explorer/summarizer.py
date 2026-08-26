@@ -115,6 +115,75 @@ def load_map(pdf_path: str) -> dict[str, Any] | None:
     return data
 
 
+def _merge_to_chapters(entries: list[dict[str, Any]], page_count: int,
+                      level: int = 1) -> list[dict[str, Any]]:
+    """Turn TOC entries into contiguous chapters covering every page.
+
+    Short sections are merged into their neighbour rather than dropped. The
+    previous behaviour discarded any span below MIN_CHAPTER_PAGES, which on a
+    fine-grained TOC punched holes straight through the map: a 95-entry
+    contents listing produced chapters 11-14, 15-18, 27-29, 31-33 ... leaving
+    pages 1-10 and 19-26 indexed by nothing at all. A map with holes is worse
+    than a coarse one, because the gaps are invisible to the reader.
+    """
+    ordered = [e for e in entries if e.get("page")]
+    if not ordered:
+        return []
+    ordered = sorted(ordered, key=lambda e: int(e["page"]))
+
+    spans: list[dict[str, Any]] = []
+    # Front matter ahead of the first entry still belongs to the document.
+    first = int(ordered[0]["page"])
+    if first > 1:
+        spans.append({"title": "Front matter", "start": 1, "end": first - 1})
+    for i, entry in enumerate(ordered):
+        start = int(entry["page"])
+        end = (int(ordered[i + 1]["page"]) - 1) if i + 1 < len(ordered) else page_count
+        if end < start:
+            continue
+        spans.append({"title": str(entry.get("title") or f"Section {i + 1}"),
+                      "start": start, "end": min(end, page_count)})
+    if not spans:
+        return []
+
+    # Merge forward to the minimum size, then again if the count would blow
+    # past the ceiling: with many entries the binding constraint is MAX_CHAPTERS
+    # (one LLM call each), not the minimum span.
+    # Three competing floors. MIN_CHAPTER_PAGES stops slivers; page_count /
+    # MAX_CHAPTERS caps the number of LLM calls; the last keeps a mid-size
+    # document from being cut into the smallest legal pieces just because its
+    # contents listing is fine-grained — 115 pages against a 95-entry listing
+    # produced 33 three-page chapters and a ~200s map build, where 14 chapters
+    # of ~8 pages carry the same navigation for a third of the cost. Small
+    # documents keep their fine granularity: the last floor scales with size.
+    target = max(MIN_CHAPTER_PAGES,
+                 -(-page_count // MAX_CHAPTERS),
+                 min(8, -(-page_count // 12)))
+    chapters: list[dict[str, Any]] = []
+    for span in spans:
+        if chapters and (chapters[-1]["end"] - chapters[-1]["start"] + 1) < target:
+            previous = chapters[-1]
+            previous["end"] = span["end"]
+            # Keep the opening title; a merged range is named by where it starts.
+            previous["titles"].append(span["title"])
+        else:
+            chapters.append({"title": span["title"], "start": span["start"],
+                             "end": span["end"], "level": level,
+                             "titles": [span["title"]]})
+    # A trailing short chapter has no successor to absorb it; fold it back.
+    if len(chapters) > 1 and (chapters[-1]["end"] - chapters[-1]["start"] + 1) < MIN_CHAPTER_PAGES:
+        tail = chapters.pop()
+        chapters[-1]["end"] = tail["end"]
+        chapters[-1]["titles"].extend(tail["titles"])
+
+    for chapter in chapters:
+        names = chapter.pop("titles")
+        # Name a merged range by its span so the map shows what it covers.
+        if len(names) > 1:
+            chapter["title"] = f"{names[0]} \u2192 {names[-1]}"
+    return chapters
+
+
 def _segment_chapters(toc: list[dict[str, Any]], page_count: int,
                       _want_source: bool = False):
     """Turn a flat TOC into non-overlapping page ranges.
@@ -140,14 +209,7 @@ def _segment_chapters(toc: list[dict[str, Any]], page_count: int,
         entries = [e for e in toc if int(e.get("level", 1)) == level and e.get("page")]
         if not entries:
             continue
-        chapters = []
-        for i, entry in enumerate(entries):
-            start = int(entry["page"])
-            end = (int(entries[i + 1]["page"]) - 1) if i + 1 < len(entries) else page_count
-            if end - start + 1 < MIN_CHAPTER_PAGES:
-                continue
-            chapters.append({"title": str(entry.get("title") or f"Section {i+1}"),
-                             "start": start, "end": min(end, page_count), "level": level})
+        chapters = _merge_to_chapters(entries, page_count, level)
         if not (2 <= len(chapters) <= MAX_CHAPTERS):
             continue
         # Reject a level where any single span swallows a big slice of the book.
@@ -170,6 +232,159 @@ def _segment_chapters(toc: list[dict[str, Any]], page_count: int,
     return _out([{"title": f"Pages {s}-{min(s + block - 1, page_count)}",
                   "start": s, "end": min(s + block - 1, page_count), "level": 0}
                  for s in range(1, page_count + 1, block)], "fallback")
+
+
+# Front matter scanned for a printed contents listing. A real TOC is always
+# near the front; scanning further would start matching per-chapter outlines.
+TOC_SCAN_PAGES = int(os.environ.get("EXPLORER_TOC_SCAN_PAGES", "20"))
+
+PRINTED_TOC_PROMPT = """You are reading the table-of-contents pages of a document.
+
+Extract every entry into JSON. Return ONLY this object:
+{"entries": [{"title": "Section 1: Introduction", "page": 7}, ...]}
+
+Rules:
+- "page" is the page number printed at the end of the entry's line, as an integer.
+- Copy titles exactly as printed, including any section number.
+- Keep the printed order. Include every entry, including sub-entries.
+- Skip lines that are not contents entries (headers, footers, page banners).
+- If the pages contain no table of contents, return {"entries": []}."""
+
+
+def _toc_candidate_pages(doc, page_count: int) -> list[int]:
+    """Front-matter pages that look like a printed contents listing.
+
+    Detection is by dot leaders and the heading, both literal substring tests.
+    A contents page is overwhelmingly leader lines, so the count separates it
+    from a page that merely mentions the phrase.
+    """
+    found: list[int] = []
+    for number in range(1, min(TOC_SCAN_PAGES, page_count) + 1):
+        try:
+            text = doc[number - 1].get_text()
+        except Exception:
+            continue
+        lowered = text.lower()
+        leaders = sum(1 for line in text.splitlines()
+                      if "...." in line or ". . . ." in line)
+        heading = ("table of contents" in lowered
+                   or "list of figures" in lowered
+                   or "list of tables" in lowered)
+        if leaders >= 8 or (heading and leaders >= 3):
+            found.append(number)
+    return found
+
+
+def _resolve_page_offset(doc, entries: list[dict[str, Any]], page_count: int,
+                         skip: set[int]) -> int | None:
+    """Delta between the numbers printed in the TOC and real PDF page indices.
+
+    They rarely agree: front matter is usually numbered i, ii, iii, so printed
+    page 7 can be PDF page 8. Each entry votes by having its title located in
+    the document; the majority delta wins. Without this the map would cite
+    pages that are consistently off by a few, which is worse than no map.
+    """
+    votes: dict[int, int] = {}
+    for entry in entries[:16]:
+        title = " ".join(str(entry.get("title") or "").split())
+        claimed = entry.get("page")
+        if not isinstance(claimed, int) or len(title) < 8:
+            continue
+        key = title[:48]
+        for delta in range(-3, 10):
+            target = claimed + delta
+            # The contents pages themselves list every title, so matching there
+            # would vote for whatever delta happens to point back at them.
+            if target in skip or not (1 <= target <= page_count):
+                continue
+            try:
+                if doc[target - 1].search_for(key):
+                    votes[delta] = votes.get(delta, 0) + 1
+                    break
+            except Exception:
+                break
+    if not votes:
+        return None
+    delta, count = max(votes.items(), key=lambda kv: kv[1])
+    # One or two agreeing entries can be coincidence on a repeated heading.
+    return delta if count >= 3 else None
+
+
+async def printed_toc(pdf_path: str, page_count: int,
+                      provider: str = "local") -> list[dict[str, Any]]:
+    """Read a document's printed table of contents into TOC-shaped entries.
+
+    Only reached when the PDF carries no embedded outline. Many documents that
+    return nothing from pdf_get_toc still print a full contents listing in
+    their front matter — the INCOSE requirements guide has 95 leader lines on
+    pages 5-7 and zero outline entries — and without this the map falls back to
+    equal page blocks titled "Pages 1-17", which navigate nothing.
+
+    Parsed by the model rather than by pattern-matching the leader lines: the
+    layouts vary (numbered, unnumbered, wrapped titles, multi-column) and the
+    summarizer already speaks JSON to this provider.
+    """
+    try:
+        import pymupdf
+        doc = pymupdf.open(pdf_path)
+    except Exception:
+        return []
+    try:
+        pages = _toc_candidate_pages(doc, page_count)
+        if not pages:
+            return []
+        text = "\n\n".join(
+            f"--- printed page {n} ---\n{doc[n - 1].get_text()}" for n in pages)
+        try:
+            reply = await _ask(provider, PRINTED_TOC_PROMPT, _sample(text),
+                               max_tokens=8192)
+            parsed = _parse_json_object(reply)
+        except Exception:
+            return []
+        raw = parsed.get("entries")
+        if not isinstance(raw, list):
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            number = item.get("page")
+            if isinstance(number, str) and number.strip().isdigit():
+                number = int(number.strip())
+            # A "LIST OF FIGURES" page carries dot leaders too, so its lines
+            # arrive alongside the real entries and, once sorted by page,
+            # interleave with them: chapters ended up titled "FIGURE 2: NEEDS
+            # AND REQUIREMENTS IN CONTEXT." A caption names an illustration,
+            # not a section of the document.
+            heading = title.upper()
+            if heading.startswith(("FIGURE ", "TABLE ", "APPENDIX FIGURE ")):
+                continue
+            if title and isinstance(number, int) and number > 0:
+                entries.append({"title": title, "page": number})
+        if len(entries) < 3:
+            return []
+
+        offset = _resolve_page_offset(doc, entries, page_count, set(pages))
+        if offset is None:
+            return []
+
+        shifted: list[dict[str, Any]] = []
+        for entry in entries:
+            target = entry["page"] + offset
+            if 1 <= target <= page_count:
+                shifted.append({"title": entry["title"], "page": target, "level": 1})
+        # The model reads in printed order, but a mis-read number can break it;
+        # segmentation derives each range's end from the next entry, so a
+        # descending pair would produce a negative span.
+        shifted.sort(key=lambda e: e["page"])
+        return shifted
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 def toc_is_navigable(toc: list[dict[str, Any]], page_count: int) -> bool:
@@ -238,9 +453,27 @@ async def build_core_map(
 ) -> dict[str, Any]:
     started = time.monotonic()
 
+    printed_entries: list[dict[str, Any]] = []
     toc_result = extract_json(await call_tool("pdf_get_toc", {"path": pdf_path}))
     toc = toc_result.get("toc", []) if isinstance(toc_result, dict) else []
     chapters, segmentation = _segment_chapters(toc, page_count, _want_source=True)
+
+    # No embedded outline that segments cleanly. Before settling for equal page
+    # blocks, look for a contents listing printed in the front matter: it gives
+    # real section titles, and it is the only way the agent can see them at all,
+    # since pdf_get_toc reports the empty outline.
+    if segmentation == "fallback":
+        if on_progress:
+            on_progress(0, 1, "reading printed contents")
+        printed = await printed_toc(pdf_path, page_count, provider)
+        if printed:
+            candidate, source = _segment_chapters(
+                printed, page_count, _want_source=True)
+            if source == "toc":
+                chapters, segmentation = candidate, "printed-toc"
+                # Kept whole, not merged: the map needs a handful of chapters
+                # to summarise, the viewer's Contents panel needs every entry.
+                printed_entries = printed
 
     slots = MAP_CONCURRENCY or await providers.slots_for(provider)
     limit = asyncio.Semaphore(max(1, slots))
@@ -321,6 +554,7 @@ async def build_core_map(
         "generated_at": time.time(),
         "elapsed": round(time.monotonic() - started, 1),
         "segmentation": segmentation,
+        "printed_toc": printed_entries,
         "chapters": indexed,
         "digest": digest.strip(),
         "topics": {k: sorted(set(v)) for k, v in sorted(topics.items())},

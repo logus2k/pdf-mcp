@@ -128,15 +128,19 @@ async function loadToc(path) {
   const list = el("toc-list");
   list.textContent = "";
   try {
-    const res = await fetch("api/call", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "pdf_get_toc", arguments: { path } }),
-    });
+    // api/outline, not pdf_get_toc directly: when a PDF has no embedded
+    // outline the backend falls back to the contents listing printed in its
+    // front matter, recovered during warming. Asking the tool alone is what
+    // left this panel empty on documents that plainly have a contents page.
+    const res = await fetch(`api/outline?path=${encodeURIComponent(path)}`);
     const data = await res.json();
-    const payload = JSON.parse(data.content[0].text);
-    const entries = payload.toc || [];
+    const entries = data.entries || [];
     el("toc-count").textContent = entries.length ? String(entries.length) : "";
+    const note = el("toc-source");
+    if (note) {
+      note.textContent = data.source === "printed"
+        ? "from the printed contents page" : "";
+    }
     if (!entries.length) {
       const li = document.createElement("li");
       li.className = "toc-empty";
@@ -639,6 +643,13 @@ function renderWarm(p) {
   if (p.state === "done" || p.state === "failed") {
     _warmHideTimer = setTimeout(() => { slot.hidden = true; }, 8000);
     refreshCacheStatus();
+    // A document with no embedded outline has its contents recovered from the
+    // printed contents page during warming, so at openDocument time there was
+    // nothing to show and the panel settled on "No outline in this PDF."
+    // Nothing re-ran it afterwards, so the entries stayed invisible until the
+    // next reload — while a document that carries a real outline populated
+    // instantly, which looked like the extraction had failed.
+    if (p.state === "done" && p.path === state.document) loadToc(p.path);
   }
 }
 

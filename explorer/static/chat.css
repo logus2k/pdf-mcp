@@ -380,3 +380,13 @@ body > canvas {
 }
 @keyframes mic-pulse { 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { #mic-btn.listening { animation: none; } }
+
+/* Provenance note under the Contents heading. Muted: it is a caveat, not a
+   label the reader needs on every glance. */
+.toc-source {
+  font-size: 11px;
+  color: var(--muted, #8a8f98);
+  margin: -4px 0 6px 0;
+  font-style: italic;
+}
+.toc-source:empty { display: none; }

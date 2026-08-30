@@ -181,7 +181,16 @@ async def run_agent(
             "paraphrases the document rather than quoting it, asks about a "
             "concept, or when pdf_search's matches read as off-topic. Running "
             "both and merging what they find is the stronger answer; they "
-            "return different passages."
+            "return different passages.\n"
+            "Questions about a figure, diagram, chart or illustration — what it "
+            "shows, what its boxes or axes are, how its parts connect — MUST go "
+            "to pdf_semantic_search. Descriptions of the document's figures are "
+            "generated from the page images and stored ONLY in that index; "
+            "pdf_search covers the printed words and cannot see a diagram at "
+            "all, so it will answer from whatever prose happens to sit near the "
+            "caption. A result marked kind=\"figure\" is such a description: "
+            "cite its page, and do not quote it as if it were the document's "
+            "own wording."
         )
     if document:
         system += (

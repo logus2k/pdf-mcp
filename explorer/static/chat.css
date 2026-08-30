@@ -385,8 +385,18 @@ body > canvas {
    label the reader needs on every glance. */
 .toc-source {
   font-size: 11px;
-  color: var(--muted, #8a8f98);
+  color: var(--ink-soft);
   margin: -4px 0 6px 0;
   font-style: italic;
 }
 .toc-source:empty { display: none; }
+
+/* Cancel control on the indexing bar. Sized to the status bar's 11px text so
+   it does not stretch the row, and only shown while an import is running. */
+.warm-cancel {
+  border: none; background: none; cursor: pointer;
+  color: var(--ink-soft); font-size: 14px; line-height: 1;
+  padding: 0 2px; margin-left: 4px; border-radius: 3px;
+}
+.warm-cancel:hover { color: var(--err); background: var(--panel-2); }
+.warm-cancel[hidden] { display: none; }

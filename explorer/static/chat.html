@@ -94,6 +94,12 @@
       <span class="warm-label" id="warm-label">indexing</span>
       <span class="warm-track"><span class="warm-fill" id="warm-fill"></span></span>
       <span class="warm-num" id="warm-num"></span>
+      <!-- Cancel: stops the import and clears what it already wrote. Before
+           this the only way to abandon a half-finished import was to delete
+           the file and restart the container. -->
+      <button type="button" class="warm-cancel" id="warm-cancel"
+              title="Cancel this import and discard what it has indexed so far"
+              aria-label="Cancel import">&times;</button>
     </span>
     <span class="st st-spacer"></span>
     <span class="st" id="st-activity" title="Last turn">idle</span>

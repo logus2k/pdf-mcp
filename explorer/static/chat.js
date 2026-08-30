@@ -606,13 +606,40 @@ function renderWarm(p) {
   // document being viewed, or one this browser uploaded itself.
   const mine = p.path && (p.path === state.document || state.myUploads.has(p.path));
   if (!mine) return;
+
+  // A cancelled import has nothing left to report. Without this the backend's
+  // "cancelled" event fell through to the running branch and re-showed the bar
+  // — complete with its X — immediately after the user had dismissed it.
+  if (p.state === "cancelled") {
+    clearTimeout(_warmHideTimer);
+    slot.hidden = true;
+    const x = el("warm-cancel");
+    if (x) x.hidden = true;
+    return;
+  }
   const total = p.total || 0;
-  const units = (p.text_done || 0) + (p.emb_done || 0);
-  const pct = total ? Math.min(100, Math.round((units / (2 * total)) * 100)) : 0;
+  // Three phases of work, not two. Figures are counted in the denominator only
+  // once their phase has established how many pages carry one — before that
+  // figures_total is 0 and the bar behaves exactly as it did. Without this the
+  // bar sat frozen at 50% for the whole "describing figures" phase, which on a
+  // 472-page manual with 57 figures is not a short stall.
+  const figTotal = p.figures_total || 0;
+  const units = (p.text_done || 0) + (p.emb_done || 0) + (p.figures_done || 0);
+  const denom = 2 * total + figTotal;
+  const pct = denom ? Math.min(100, Math.round((units / denom) * 100)) : 0;
 
   slot.hidden = false;
   slot.classList.toggle("done", p.state === "done");
   slot.classList.toggle("failed", p.state === "failed");
+
+  // Only offer cancel while there is something to cancel; a finished or failed
+  // import has nothing running, and its rows are the document's real index.
+  const cancel = el("warm-cancel");
+  if (cancel) {
+    const running = p.state !== "done" && p.state !== "failed";
+    cancel.hidden = !running;
+    cancel.dataset.path = p.path || "";
+  }
   el("warm-fill").style.width = pct + "%";
 
   if (p.state === "failed") {
@@ -623,10 +650,19 @@ function renderWarm(p) {
     el("warm-num").textContent = `${total} pages · ${p.elapsed}s`;
   } else {
     el("warm-label").textContent =
-      p.phase === "embedding" ? "embedding" : "extracting";
-    const shown = p.phase === "embedding" ? p.emb_done : p.text_done;
+      p.phase === "embedding" ? "embedding"
+      : p.phase === "figures" ? "describing figures"
+      : p.phase === "semantic" ? "indexing"
+      : "extracting";
+    const shown = p.phase === "embedding" ? p.emb_done
+      : p.phase === "figures" ? p.figures_done
+      : p.text_done;
+    // The figures phase counts pages carrying a figure — a handful — not the
+    // document's pages, so it needs its own denominator or it would read
+    // "2/115" and look stalled.
+    const outOf = p.phase === "figures" ? (p.figures_total || 0) : total;
     const eta = p.eta != null && p.eta > 0 ? ` · ~${Math.ceil(p.eta)}s left` : "";
-    el("warm-num").textContent = `${shown}/${total}${eta}`;
+    el("warm-num").textContent = `${shown ?? 0}/${outOf}${eta}`;
   }
   slot.title = `${p.name || "document"} — ${pct}% indexed`;
 
@@ -650,6 +686,45 @@ function renderWarm(p) {
     // next reload — while a document that carries a real outline populated
     // instantly, which looked like the extraction had failed.
     if (p.state === "done" && p.path === state.document) loadToc(p.path);
+  }
+}
+
+/* ---------------- cancel an import ---------------- */
+
+async function cancelWarm() {
+  const button = el("warm-cancel");
+  const path = button && button.dataset.path;
+  if (!path) return;
+  // The document stays on disk — cancelling abandons a partial index, it does
+  // not discard the upload, so the import can be re-run without re-uploading.
+  if (!confirm(`Cancel indexing "${path.split("/").pop()}" and discard what has `
+             + `been indexed so far?\n\nThe document itself is kept.`)) return;
+  button.disabled = true;
+  try {
+    const res = await fetch("api/warm/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const slot = el("st-warm");
+    if (slot) slot.hidden = true;
+    const note = el("composer-note");
+    if (note) {
+      note.className = "composer-note";
+      note.textContent = `Indexing cancelled for ${path.split("/").pop()}. `
+                       + `The document is still listed — re-run the import when ready.`;
+    }
+    refreshCacheStatus();
+    loadDocuments();
+  } catch (err) {
+    const note = el("composer-note");
+    if (note) {
+      note.className = "composer-note error";
+      note.textContent = `Could not cancel: ${err.message}`;
+    }
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -874,6 +949,7 @@ async function boot() {
   el("composer").addEventListener("submit", () => stopSpeaking());
 
   const uploadInput = el("upload-input");
+  el("warm-cancel")?.addEventListener("click", cancelWarm);
   el("upload-btn").addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => uploadDocument(uploadInput));
 }

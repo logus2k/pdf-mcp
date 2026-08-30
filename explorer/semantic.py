@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS chunks (
   bbox        TEXT,
   text        TEXT NOT NULL,
   vector      BLOB NOT NULL,
-  dim         INTEGER NOT NULL
+  dim         INTEGER NOT NULL,
+  kind        TEXT NOT NULL DEFAULT 'text'
 );
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 """
@@ -87,6 +88,13 @@ def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(_SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a database
+    # written before figures were indexed keeps the old column set and every
+    # query naming `kind` fails. Add it in place rather than forcing a reindex.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+    if "kind" not in columns:
+        conn.execute("ALTER TABLE chunks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'")
+        conn.commit()
     return conn
 
 
@@ -194,10 +202,61 @@ def is_indexed(path: str) -> bool:
         conn.close()
 
 
+def figures_indexed(path: str) -> bool:
+    """Are this document's figure descriptions already stored and current?
+
+    Keyed on mtime+size like everything else here, so replacing the file
+    re-describes it. Without this check every container restart re-ran the
+    vision pass for every document — 57 figures on the 472-page manual, paid
+    again on each rebuild for descriptions that had not changed.
+    """
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE path=? AND mtime=? AND size=?"
+            " AND kind='figure'", (path, stat.st_mtime, stat.st_size)).fetchone()
+        return bool(row and row[0])
+    finally:
+        conn.close()
+
+
+def chunk_count(path: str) -> int:
+    """How many chunks are stored for this document, current file only."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return 0
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE path=? AND mtime=? AND size=?",
+            (path, stat.st_mtime, stat.st_size)).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
 def drop(path: str) -> int:
+    """Remove everything indexed for a document, figures included."""
     conn = _connect()
     try:
         n = conn.execute("DELETE FROM chunks WHERE path=?", (path,)).rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def drop_text(path: str) -> int:
+    """Remove only the text chunks, leaving figure descriptions in place."""
+    conn = _connect()
+    try:
+        n = conn.execute("DELETE FROM chunks WHERE path=? AND kind='text'",
+                         (path,)).rowcount
         conn.commit()
         return n
     finally:
@@ -244,7 +303,11 @@ async def index_document(path: str, pages: Iterable[dict[str, Any]],
     """Chunk and embed every page. `pages` is pdf_read_pages' page list."""
     started = time.monotonic()
     stat = Path(path).stat()
-    drop(path)
+    # Text chunks only. Dropping the whole path would take the figure
+    # descriptions with it, and they are re-created by a vision call each —
+    # so the "already described?" check downstream would always miss and every
+    # restart would pay for them again.
+    drop_text(path)
 
     try:
         import pymupdf
@@ -269,7 +332,7 @@ async def index_document(path: str, pages: Iterable[dict[str, Any]],
             vectors = await embed_texts([r[4] for r in batch])
             conn.executemany(
                 "INSERT INTO chunks(path,mtime,size,page,ordinal,start_char,"
-                "end_char,bbox,text,vector,dim) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "end_char,bbox,text,vector,dim,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'text')",
                 [(path, stat.st_mtime, stat.st_size, r[0], r[1], r[2], r[3],
                   json.dumps(r[5]) if r[5] else None,
                   r[4], _pack(_norm(v)), len(v)) for r, v in zip(batch, vectors)])
@@ -323,12 +386,50 @@ def _diversify(scored: list[dict[str, Any]], top_k: int,
     return picked
 
 
+async def index_figures(path: str, records: list[dict[str, Any]]) -> int:
+    """Store figure descriptions alongside the text chunks.
+
+    They live in the same table and are searched by the same cosine pass, so a
+    question about a diagram competes with the prose on equal terms instead of
+    needing a separate retrieval path. `kind` is what lets a hit say it came
+    from a figure, and the stored bbox is the figure's own rectangle, so the
+    viewer highlights the diagram rather than the whole page.
+
+    Called after index_document, which clears the document's rows; ordering
+    matters, since dropping afterwards would take the descriptions with it.
+    """
+    if not records:
+        return 0
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return 0
+
+    conn = _connect()
+    try:
+        # Re-describing a document should replace its figures, not add a second
+        # copy of every one.
+        conn.execute("DELETE FROM chunks WHERE path=? AND kind='figure'", (path,))
+        vectors = await embed_texts([r["text"] for r in records])
+        conn.executemany(
+            "INSERT INTO chunks(path,mtime,size,page,ordinal,start_char,"
+            "end_char,bbox,text,vector,dim,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'figure')",
+            [(path, stat.st_mtime, stat.st_size, int(r["page"]), ordinal, 0, 0,
+              json.dumps(r["bbox"]) if r.get("bbox") else None,
+              r["text"], _pack(_norm(v)), len(v))
+             for ordinal, (r, v) in enumerate(zip(records, vectors))])
+        conn.commit()
+        return len(records)
+    finally:
+        conn.close()
+
+
 async def search(path: str, query: str, top_k: int = 8) -> list[dict[str, Any]]:
     """Cosine search over this document's chunks, at most PAGE_CAP per page."""
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT page, ordinal, start_char, end_char, bbox, text, vector"
+            "SELECT page, ordinal, start_char, end_char, bbox, text, vector, kind"
             " FROM chunks WHERE path=?", (path,)).fetchall()
     finally:
         conn.close()
@@ -337,13 +438,14 @@ async def search(path: str, query: str, top_k: int = 8) -> list[dict[str, Any]]:
 
     qvec = _norm((await embed_texts([query]))[0])
     scored = []
-    for page, ordinal, begin, finish, box, text, blob in rows:
+    for page, ordinal, begin, finish, box, text, blob, kind in rows:
         vec = _unpack(blob)
         score = sum(a * b for a, b in zip(qvec, vec))
         scored.append({"page": page, "ordinal": ordinal,
                        "start_char": begin, "end_char": finish,
                        "bbox": json.loads(box) if box else None,
-                       "excerpt": text, "score": round(score, 4)})
+                       "excerpt": text, "score": round(score, 4),
+                       "kind": kind or "text"})
     scored.sort(key=lambda r: r["score"], reverse=True)
     picked = _diversify(scored, top_k)
     # _diversify walks pages in rounds, so the tail of the list is not in score

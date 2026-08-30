@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,6 +28,7 @@ from pydantic import BaseModel
 
 import agent
 import providers
+import figures
 import semantic
 import summarizer
 import voice
@@ -234,6 +236,10 @@ async def lifespan(app: FastAPI):
 
     info = _first_json_block(await client.call_tool("server_info", {}))
     roots = info.get("documents", {}).get("roots", []) if isinstance(info, dict) else []
+    # Settled before the warm worker starts, so the first document indexed
+    # already knows whether its figures can be described.
+    await _resolve_figure_indexing()
+
     watcher = asyncio.create_task(_watch_documents(roots))
     warmer = asyncio.create_task(_warm_worker())
     # Index whatever is already in the folder. Cheap when the cache is warm
@@ -292,9 +298,17 @@ async def api_chat(body: ChatRequest) -> StreamingResponse:
                 arguments.get("path") or body.document or "",
                 arguments.get("query", ""),
                 int(arguments.get("max_results") or 8))
+            # Figure hits are labelled: their text is a description generated
+            # from the page image, not words printed on the page. Without the
+            # label the model would quote it as if it were the document's own
+            # prose.
             payload = {"matches": [
                 {"page": h["page"], "excerpt": h["excerpt"][:1200],
-                 "score": h["score"], "bbox": h["bbox"]}
+                 "score": h["score"], "bbox": h["bbox"],
+                 "kind": h.get("kind", "text"),
+                 **({"note": "description of a figure on this page, "
+                             "generated from the page image"}
+                    if h.get("kind") == "figure" else {})}
                 for h in hits], "total_matches": len(hits),
                 "search_mode": "semantic-chunked-bge-m3"}
             return {"content": [{"type": "text", "text": json.dumps(payload)}]}
@@ -363,6 +377,11 @@ WARM_UPLOAD, WARM_DISCOVERED, WARM_STARTUP = 0, 1, 2
 warm_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
 _warm_seq = 0
 
+# The in-flight warm for each path, so it can be cancelled. Without a handle on
+# the task the only way to stop an import was to restart the container, which
+# also killed every other document's queued work.
+warm_tasks: dict[str, asyncio.Task] = {}
+
 
 def enqueue_warm(path: str, priority: int = WARM_DISCOVERED) -> None:
     global _warm_seq
@@ -385,7 +404,17 @@ async def _warm_worker() -> None:
             info = _first_json_block(await client.call_tool("pdf_info", {"path": path}))
             if not isinstance(info, dict) or info.get("error"):
                 continue
-            await _warm_document(path, int(info["page_count"]))
+            task = asyncio.create_task(_warm_document(path, int(info["page_count"])))
+            warm_tasks[path] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Cancelling the child must not take the worker down with it,
+                # or one cancelled import would stall every document behind it
+                # in the queue.
+                pass
+            finally:
+                warm_tasks.pop(path, None)
         except Exception as exc:
             client._publish("warm", {"path": path, "name": Path(path).name,
                                      "state": "failed", "message": str(exc)})
@@ -405,11 +434,42 @@ elif MAP_MODE in ("0", ""):
     MAP_MODE = "auto"
 MAP_PROVIDER = os.environ.get("EXPLORER_MAP_PROVIDER", "local")
 
+# Figure indexing: "auto" describes figures only if the model server really is
+# multimodal, "on" forces it, "off" disables it. Auto probes rather than trusts
+# the model name — a text-only server answers an image request with HTTP 200
+# and confident prose about nothing, so assuming the capability would quietly
+# fill the index with hallucinated descriptions.
+FIGURE_MODE = os.environ.get("EXPLORER_INDEX_FIGURES", "auto").lower()
+FIGURE_INDEXING = FIGURE_MODE == "on"
+
+
+async def _resolve_figure_indexing() -> None:
+    """Settle the auto case once, at startup, and say so in the log."""
+    global FIGURE_INDEXING
+    if FIGURE_MODE == "off":
+        FIGURE_INDEXING = False
+        print("[figures] disabled by EXPLORER_INDEX_FIGURES=off", flush=True)
+        return
+    if FIGURE_MODE == "on":
+        FIGURE_INDEXING = True
+        print("[figures] forced on", flush=True)
+        return
+    FIGURE_INDEXING = await figures.vision_available()
+    print(f"[figures] vision probe: "
+          f"{'available — figures will be described' if FIGURE_INDEXING else 'not available — skipping'}",
+          flush=True)
+
 
 async def _should_build_map(path: str) -> tuple[bool, str]:
     """(build?, reason) — reason is surfaced so the choice is never silent."""
     if MAP_MODE == "never":
         return False, "disabled (EXPLORER_BUILD_MAP=never)"
+    # load_map validates mtime+size, so this only matches a map built for the
+    # file as it is now. Without it every restart regenerated the map from
+    # scratch — one LLM call per chapter, ~60s for a 14-chapter document —
+    # to produce the map already sitting on disk.
+    if summarizer.load_map(path):
+        return False, "map already built for this file"
     info = _first_json_block(await client.call_tool("pdf_info", {"path": path}))
     if not isinstance(info, dict) or info.get("error"):
         return False, f"pdf_info failed: {(info or {}).get('error')}"
@@ -486,21 +546,66 @@ async def _warm_document(path: str, total_pages: int) -> None:
         state["phase"] = "semantic"
         state["eta"] = None
         publish()
+        # Keyed on mtime+size, so a replaced file still re-indexes. Without this
+        # every restart re-chunked and re-embedded every page of every document
+        # — minutes of GPU work per large manual to rebuild rows that were
+        # already correct. Only the figure phase was guarded.
         try:
-            pages_payload = _first_json_block(await client.call_tool(
-                "pdf_read_pages", {"path": path, "pages": f"1-{total_pages}"}))
-            page_list = (pages_payload or {}).get("pages", [])
-
-            def _chunk_progress(done: int, total: int) -> None:
-                state["chunks_done"], state["chunks_total"] = done, total
+            if semantic.is_indexed(path):
+                # Already chunked and embedded for this exact file. Re-doing it
+                # dropped every row and re-embedded every page on each restart —
+                # minutes of GPU work per large manual to rebuild rows that were
+                # already correct. Only the figure phase had a guard.
+                state["chunks"] = semantic.chunk_count(path)
+                state["chunks_done"] = state["chunks_total"] = state["chunks"]
+                state["semantic_skipped"] = True
                 publish()
+            else:
+                pages_payload = _first_json_block(await client.call_tool(
+                    "pdf_read_pages", {"path": path, "pages": f"1-{total_pages}"}))
+                page_list = (pages_payload or {}).get("pages", [])
 
-            result = await semantic.index_document(path, page_list, _chunk_progress)
-            state["chunks"] = result.get("chunks")
-            state["chunks_with_bbox"] = result.get("with_bbox")
+                def _chunk_progress(done: int, total: int) -> None:
+                    state["chunks_done"], state["chunks_total"] = done, total
+                    publish()
+
+                result = await semantic.index_document(
+                    path, page_list, _chunk_progress)
+                state["chunks"] = result.get("chunks")
+                state["chunks_with_bbox"] = result.get("with_bbox")
         except Exception as exc:
             state["semantic_error"] = str(exc)
         publish()
+
+        # Figure descriptions. The local model is multimodal, so a page's
+        # diagrams are described and indexed as text; without this a figure is
+        # invisible to every search the app can run. Only pages whose images
+        # are not repeated furniture and cover enough of the page get a call —
+        # 6 of 115 on the INCOSE guide, against 164 extracted images.
+        # The text pass clears only text chunks, so descriptions from an
+        # earlier run survive and this check can see them. Keyed on mtime+size,
+        # so a replaced file is re-described and an unchanged one is not:
+        # without it every rebuild paid for 57 vision calls on the 472-page
+        # manual to regenerate descriptions that had not changed.
+        if FIGURE_INDEXING and not semantic.figures_indexed(path):
+            state["phase"] = "figures"
+            state["eta"] = None
+            publish()
+            try:
+                def _figure_progress(done: int, total: int) -> None:
+                    state["figures_done"], state["figures_total"] = done, total
+                    publish()
+
+                described = await figures.describe_document(
+                    path, provider=MAP_PROVIDER, on_progress=_figure_progress)
+                stored = await semantic.index_figures(path, described["records"])
+                state["figures"] = stored
+                state["figure_pages"] = described["pages"]
+            except Exception as exc:
+                # A document is still fully usable without figure descriptions;
+                # losing the whole warm over them would be a bad trade.
+                state["figure_error"] = str(exc)
+            publish()
 
         state["phase"] = "embedding"
         state["eta"] = None
@@ -642,8 +747,114 @@ async def api_warm(body: WarmRequest) -> dict[str, Any]:
     if not isinstance(info, dict) or info.get("error"):
         raise HTTPException(status_code=400,
                             detail=(info or {}).get("error", "cannot read that PDF"))
-    asyncio.create_task(_warm_document(body.path, int(info["page_count"])))
+    task = asyncio.create_task(_warm_document(body.path, int(info["page_count"])))
+    warm_tasks[body.path] = task
+    task.add_done_callback(lambda _t, p=body.path: warm_tasks.pop(p, None))
     return {"status": "started", "pages": info["page_count"]}
+
+
+async def purge_document(path: str) -> dict[str, Any]:
+    """Remove everything this document has written to the indexes.
+
+    Used by cancel, where a half-finished import leaves rows in three separate
+    stores. Each is cleared independently: a failure in one must not strand the
+    others, since the point of cancelling is to be able to start clean.
+    """
+    result: dict[str, Any] = {}
+    try:
+        result["semantic_rows"] = semantic.drop(path)
+    except Exception as exc:
+        result["semantic_error"] = str(exc)
+    try:
+        map_file = summarizer.map_path_for(path)
+        result["map_removed"] = map_file.exists()
+        map_file.unlink(missing_ok=True)
+    except Exception as exc:
+        result["map_error"] = str(exc)
+    try:
+        result["cache"] = _purge_mcp_cache(path)
+    except Exception as exc:
+        result["cache_error"] = str(exc)
+    return result
+
+
+# pdf-mcp's own cache. Reached directly because its pdf_cache_clear tool takes
+# only `expired_only` — it is all-or-nothing, and clearing everything to
+# abandon one import would throw away every other document's index. Tables are
+# discovered at run time rather than hardcoded, so a pdf-mcp schema change
+# degrades to "purged less" instead of raising.
+MCP_CACHE_DB = Path(os.environ.get(
+    "EXPLORER_MCP_CACHE_DB", str(Path.home() / ".cache" / "pdf-mcp" / "cache.db")))
+
+
+def _purge_mcp_cache(path: str) -> dict[str, Any]:
+    if not MCP_CACHE_DB.exists():
+        return {"skipped": "no cache db"}
+    conn = sqlite3.connect(MCP_CACHE_DB, timeout=15)
+    removed: dict[str, int] = {}
+    try:
+        # Extracted images are files on disk; the row only points at them, so
+        # deleting rows alone would leak the PNGs.
+        try:
+            for (on_disk,) in conn.execute(
+                    "SELECT file_path_on_disk FROM page_images WHERE file_path=?",
+                    (path,)):
+                if on_disk:
+                    Path(on_disk).unlink(missing_ok=True)
+        except sqlite3.Error:
+            pass
+
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view')")]
+        for table in tables:
+            # FTS shadow tables are maintained by their virtual table; writing
+            # to them directly corrupts the index.
+            if table.endswith(("_data", "_idx", "_content", "_docsize", "_config")):
+                continue
+            try:
+                columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if "file_path" not in columns:
+                continue
+            try:
+                n = conn.execute(
+                    f"DELETE FROM {table} WHERE file_path=?", (path,)).rowcount
+                if n:
+                    removed[table] = n
+            except sqlite3.Error:
+                continue
+        conn.commit()
+    finally:
+        conn.close()
+    return removed
+
+
+@app.post("/api/warm/cancel")
+async def api_warm_cancel(body: WarmRequest) -> dict[str, Any]:
+    """Stop an in-flight import and clear what it already wrote.
+
+    The document file itself is left in place: cancelling is about abandoning a
+    partial index, not discarding the upload, so the import can simply be run
+    again without re-uploading.
+    """
+    task = warm_tasks.get(body.path)
+    was_running = bool(task and not task.done())
+    if task:
+        task.cancel()
+        # Give the task a moment to unwind before clearing the stores, so a
+        # write already in flight cannot land after the purge.
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+        warm_tasks.pop(body.path, None)
+
+    purged = await purge_document(body.path)
+    warm_state.pop(body.path, None)
+    client._publish("warm", {"path": body.path, "name": Path(body.path).name,
+                             "state": "cancelled"})
+    return {"status": "cancelled", "was_running": was_running, "purged": purged}
 
 
 @app.get("/api/warm")
@@ -781,9 +992,15 @@ def _is_within(candidate: Path, root: Path) -> bool:
 
 
 @app.get("/api/tools")
-async def api_tools() -> dict[str, Any]:
+async def api_tools(document: str | None = None) -> dict[str, Any]:
+    """The tool list, plus pdf_semantic_search when the document has an index.
+
+    `document` is a query parameter: this is a GET, and the handler used to read
+    it off a `body` that no route ever supplies, so every call raised NameError
+    and returned 500 — which is why the /tools page listed nothing.
+    """
     tools = await client.list_tools()
-    if body.document and semantic.is_indexed(body.document):
+    if document and semantic.is_indexed(document):
         tools = tools + [semantic.TOOL_SCHEMA]
     return {
         "tools": tools,

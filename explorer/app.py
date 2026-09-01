@@ -857,6 +857,50 @@ async def api_warm_cancel(body: WarmRequest) -> dict[str, Any]:
     return {"status": "cancelled", "was_running": was_running, "purged": purged}
 
 
+@app.post("/api/document/delete")
+async def api_document_delete(body: WarmRequest) -> dict[str, Any]:
+    """Delete a document and everything indexed from it.
+
+    Unlike cancel, this removes the PDF itself. The path is re-validated
+    against pdf-mcp's allow-listed roots before anything is touched: this
+    endpoint unlinks a file, so a crafted path must not be able to reach
+    outside the document folder.
+    """
+    info = _first_json_block(await client.call_tool("server_info", {}))
+    roots = info.get("documents", {}).get("roots", []) if isinstance(info, dict) else []
+    resolved = Path(body.path).resolve()
+    if not roots or not any(_is_within(resolved, Path(r).resolve()) for r in roots):
+        raise HTTPException(status_code=403, detail="Path is outside the allowed roots")
+    if resolved.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Not a PDF")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="No such document")
+
+    # Stop any import first, or the warm task would keep writing rows for a
+    # file that is about to disappear — and then fail on the missing file.
+    task = warm_tasks.get(body.path)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    warm_tasks.pop(body.path, None)
+
+    purged = await purge_document(body.path)
+    warm_state.pop(body.path, None)
+    try:
+        resolved.unlink()
+        removed = True
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not delete the file: {exc}")
+
+    client._publish("warm", {"path": body.path, "name": Path(body.path).name,
+                             "state": "cancelled"})
+    client._publish("documents", {"count": len(_scan_roots(roots))})
+    return {"status": "deleted", "file_removed": removed, "purged": purged}
+
+
 @app.get("/api/warm")
 async def api_warm_status() -> dict[str, Any]:
     return {"warming": list(warm_state.values())}

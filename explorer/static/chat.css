@@ -400,3 +400,17 @@ body > canvas {
 }
 .warm-cancel:hover { color: var(--err); background: var(--panel-2); }
 .warm-cancel[hidden] { display: none; }
+
+/* Destructive action in the top bar. Styled apart from Upload so the two are
+   not mistaken for each other at a glance, and muted until a document is
+   actually selected. */
+#delete-btn.danger {
+  color: var(--err);
+  border-color: var(--line);
+}
+#delete-btn.danger:hover:not(:disabled) {
+  background: var(--err);
+  color: var(--panel);
+  border-color: var(--err);
+}
+#delete-btn:disabled { opacity: .45; cursor: default; }

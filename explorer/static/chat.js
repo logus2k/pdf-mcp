@@ -101,6 +101,7 @@ async function openDocument(path) {
   const seq = ++_openSeq;
   trace("openDocument START", seq, path.split("/").pop());
   state.document = path;
+  syncDeleteButton();   // enabled only when a document is actually selected
   el("viewer-empty")?.remove();
   updateDocStatus(path);
   syncWarmState();   // this document may already be indexing
@@ -689,6 +690,67 @@ function renderWarm(p) {
   }
 }
 
+/* ---------------- delete a document ---------------- */
+
+function syncDeleteButton() {
+  const button = el("delete-btn");
+  if (button) button.disabled = !state.document;
+}
+
+async function deleteDocument() {
+  const path = state.document;
+  if (!path) return;
+  const name = path.split("/").pop();
+  // Two things go at once and neither comes back, so the prompt names both
+  // rather than asking a vague "are you sure?".
+  if (!confirm(`Delete "${name}"?\n\nThis removes the PDF file itself and `
+             + `everything indexed from it (extracted text, search index, `
+             + `figure descriptions and any generated map).\n\nThis cannot be undone.`)) {
+    return;
+  }
+  const button = el("delete-btn");
+  button.disabled = true;
+  try {
+    const res = await fetch("api/document/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${res.status}`);
+    }
+    // Clear the viewer before refreshing the list: the document it is showing
+    // no longer exists, and leaving the pages up implies it does.
+    state.document = "";
+    if (state.viewer) { try { state.viewer.destroy?.(); } catch (e) {} }
+    const host = el("content-pane-host");
+    if (host) host.innerHTML = "";
+    const list = el("toc-list");
+    if (list) list.textContent = "";
+    const count = el("toc-count");
+    if (count) count.textContent = "";
+    const slot = el("st-warm");
+    if (slot) slot.hidden = true;
+
+    await loadDocuments();
+    const note = el("composer-note");
+    if (note) {
+      note.className = "composer-note";
+      note.textContent = `Deleted ${name} and everything indexed from it.`;
+    }
+    refreshCacheStatus();
+  } catch (err) {
+    const note = el("composer-note");
+    if (note) {
+      note.className = "composer-note error";
+      note.textContent = `Could not delete: ${err.message}`;
+    }
+  } finally {
+    syncDeleteButton();
+  }
+}
+
 /* ---------------- cancel an import ---------------- */
 
 async function cancelWarm() {
@@ -950,6 +1012,7 @@ async function boot() {
 
   const uploadInput = el("upload-input");
   el("warm-cancel")?.addEventListener("click", cancelWarm);
+  el("delete-btn")?.addEventListener("click", deleteDocument);
   el("upload-btn").addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => uploadDocument(uploadInput));
 }

@@ -24,6 +24,12 @@
       <button type="button" id="upload-btn" title="Add a PDF to the document folder">
         ↑ Upload
       </button>
+      <!-- Removes the PDF and everything indexed from it. Disabled until a
+           document is selected, so there is no ambiguity about the target. -->
+      <button type="button" id="delete-btn" class="danger" disabled
+              title="Delete the selected document and everything indexed from it">
+        Delete
+      </button>
       <label class="doc-picker">
         <span>Model</span>
         <select id="provider-select"></select>
